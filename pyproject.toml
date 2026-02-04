@@ -1,0 +1,33 @@
+[project]
+name = "bot-music"
+version = "0.1.0"
+description = "Discord music bot (discord.py + lavalink)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "discord.py>=2.4,<3",
+  "wavelink>=3.5,<4",
+  "python-dotenv>=1.0,<2",
+  "aiosqlite>=0.20,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.3",
+  "black>=24.1",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bot*"]
