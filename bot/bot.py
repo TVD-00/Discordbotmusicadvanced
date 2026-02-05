@@ -89,10 +89,13 @@ class MusicBot(commands.Bot):
         self._current_track: dict[int, wavelink.Playable] = {}
         self._previous_track: dict[int, wavelink.Playable] = {}
 
-    # --------------------------------------------------------------------------
-    # Method: setup_hook
-    # Purpose: Khởi chạy khi bot bắt đầu. Kết nối DB, Lavalink, Load Cogs.
-    # --------------------------------------------------------------------------
+        # Tracking lỗi theo node để tự động chuyển node khi có vấn đề
+        # Key: node identifier, Value: số lỗi trong khoảng thời gian gần đây
+        self._node_error_counts: dict[str, int] = {}
+        self._node_error_threshold = 3  # Số lỗi tối đa trước khi chuyển node
+        self._node_error_window = 60  # Giây - reset error count sau khoảng này
+        self._node_last_error_time: dict[str, float] = {}
+
     # --------------------------------------------------------------------------
     # Method: setup_hook
     # Purpose: Khởi chạy khi bot bắt đầu. Kết nối DB, Lavalink, Load Cogs.
@@ -133,28 +136,8 @@ class MusicBot(commands.Bot):
         except Exception:
             logger.exception("DB maintenance failed (non-critical)")
 
-        # 3. Kết nối Lavalink Node
-        nodes: list[wavelink.Node] = []
-        for n in getattr(self.config, "lavalink_nodes", ()):  # type: ignore[attr-defined]
-            nodes.append(
-                wavelink.Node(
-                    uri=n.uri,
-                    password=n.password,
-                    identifier=n.identifier,
-                )
-            )
-
-        if not nodes:
-            # Fallback an toàn (không nên xảy ra vì config đã validate)
-            nodes.append(
-                wavelink.Node(
-                    uri=self.config.lavalink_uri,
-                    password=self.config.lavalink_password,
-                    identifier=self.config.lavalink_identifier,
-                )
-            )
-
-        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=self.config.wavelink_cache_capacity)
+        # 3. Kết nối Lavalink Node với chiến lược fallback
+        await self._connect_lavalink_with_fallback()
 
         # 4. Load Extensions (Cogs)
         await self.load_extension("bot.cogs.music")
@@ -172,6 +155,155 @@ class MusicBot(commands.Bot):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+
+    # --------------------------------------------------------------------------
+    # Method: _connect_lavalink_with_fallback
+    # Purpose: Kết nối Lavalink theo chiến lược: primary trước, fallback sau.
+    # --------------------------------------------------------------------------
+    async def _connect_lavalink_with_fallback(self) -> None:
+        node_retries = self.config.lavalink_node_retries
+        primary = self.config.primary_lavalink_node
+        fallback_configs = self.config.fallback_lavalink_nodes
+
+        # Biến theo dõi trạng thái
+        self._using_primary_node = False
+        self._primary_node_identifier: str | None = primary.identifier if primary else None
+
+        # Chiến lược:
+        # 1. Nếu có primary node -> thử kết nối primary trước
+        # 2. Nếu primary fail hoặc không có -> dùng fallback nodes
+        # 3. Background task kiểm tra primary định kỳ để chuyển lại
+
+        nodes_to_connect: list[wavelink.Node] = []
+
+        if primary:
+            # Thử kết nối primary node trước
+            primary_node = wavelink.Node(
+                uri=primary.uri,
+                password=primary.password,
+                identifier=primary.identifier,
+                retries=node_retries,
+            )
+
+            try:
+                logger.info("Trying primary Lavalink node: %s (%s)", primary.identifier, primary.uri)
+                await wavelink.Pool.connect(
+                    nodes=[primary_node],
+                    client=self,
+                    cache_capacity=self.config.wavelink_cache_capacity,
+                )
+
+                # Kiểm tra xem node có thực sự connected không
+                await asyncio.sleep(1)  # Cho wavelink thời gian kết nối
+                pool_nodes = wavelink.Pool.nodes
+                if primary.identifier in pool_nodes:
+                    node = pool_nodes[primary.identifier]
+                    if node.status == wavelink.NodeStatus.CONNECTED:
+                        logger.info("Primary Lavalink node connected successfully: %s", primary.identifier)
+                        self._using_primary_node = True
+                        # Khởi động health check nếu có fallback
+                        if fallback_configs:
+                            self._start_primary_health_check()
+                        return
+
+                # Primary không connected, thử fallback
+                logger.warning("Primary node %s did not connect, trying fallback nodes...", primary.identifier)
+
+            except Exception as e:
+                logger.warning("Failed to connect primary node %s: %s. Trying fallback...", primary.identifier, e)
+
+        # Fallback: kết nối tất cả fallback nodes
+        if fallback_configs:
+            for n in fallback_configs:
+                nodes_to_connect.append(
+                    wavelink.Node(
+                        uri=n.uri,
+                        password=n.password,
+                        identifier=n.identifier,
+                        retries=node_retries,
+                    )
+                )
+
+            logger.info("Connecting %d fallback Lavalink nodes...", len(nodes_to_connect))
+            await wavelink.Pool.connect(
+                nodes=nodes_to_connect,
+                client=self,
+                cache_capacity=self.config.wavelink_cache_capacity,
+            )
+
+            # Khởi động health check để thử chuyển lại primary khi ổn định
+            if primary:
+                self._start_primary_health_check()
+
+        elif not self._using_primary_node:
+            # Không có cả primary lẫn fallback (không nên xảy ra vì config đã validate)
+            raise RuntimeError("No Lavalink nodes configured!")
+
+    def _start_primary_health_check(self) -> None:
+        """Khởi động background task kiểm tra primary node định kỳ."""
+        interval = self.config.lavalink_primary_health_interval
+        if interval <= 0:
+            logger.info("Primary health check disabled (interval=0)")
+            return
+
+        async def _health_check_loop() -> None:
+            await self.wait_until_ready()
+            while not self.is_closed():
+                await asyncio.sleep(interval)
+
+                if self._using_primary_node:
+                    # Đang dùng primary, không cần check
+                    continue
+
+                primary = self.config.primary_lavalink_node
+                if not primary:
+                    continue
+
+                # Kiểm tra xem primary node có trong pool và connected không
+                pool_nodes = wavelink.Pool.nodes
+                if primary.identifier in pool_nodes:
+                    node = pool_nodes[primary.identifier]
+                    if node.status == wavelink.NodeStatus.CONNECTED:
+                        logger.info("Primary node %s is back online, switching...", primary.identifier)
+                        self._using_primary_node = True
+                        # Không cần làm gì thêm, wavelink tự động dùng node available
+                        continue
+
+                # Primary chưa trong pool hoặc disconnected, thử reconnect
+                try:
+                    logger.debug("Health check: trying to reconnect primary node %s", primary.identifier)
+                    primary_node = wavelink.Node(
+                        uri=primary.uri,
+                        password=primary.password,
+                        identifier=primary.identifier,
+                        retries=1,  # Chỉ thử 1 lần trong health check
+                    )
+
+                    # Nếu node đã trong pool, thử reconnect
+                    if primary.identifier in pool_nodes:
+                        await wavelink.Pool.reconnect()
+                    else:
+                        # Node chưa trong pool, thêm mới
+                        await wavelink.Pool.connect(
+                            nodes=[primary_node],
+                            client=self,
+                            cache_capacity=self.config.wavelink_cache_capacity,
+                        )
+
+                    await asyncio.sleep(2)  # Cho wavelink thời gian kết nối
+
+                    # Kiểm tra lại
+                    pool_nodes = wavelink.Pool.nodes
+                    if primary.identifier in pool_nodes:
+                        node = pool_nodes[primary.identifier]
+                        if node.status == wavelink.NodeStatus.CONNECTED:
+                            logger.info("Primary node %s reconnected, switching back!", primary.identifier)
+                            self._using_primary_node = True
+
+                except Exception:
+                    logger.debug("Health check: primary node %s still unavailable", primary.identifier)
+
+        asyncio.create_task(_health_check_loop())
 
 
     # --------------------------------------------------------------------------
@@ -313,6 +445,9 @@ class MusicBot(commands.Bot):
                 payload.exception,
             )
 
+            # Tracking lỗi node để xem xét chuyển node
+            await self._record_node_error(player)
+
             # Best-effort: cập nhật panel để user thấy trạng thái mới.
             await self.refresh_controller_message(player)
 
@@ -328,6 +463,9 @@ class MusicBot(commands.Bot):
             payload.threshold,
         )
 
+        # Tracking lỗi node để xem xét chuyển node
+        await self._record_node_error(player)
+
         # Best-effort: thử skip để tránh kẹt.
         try:
             await player.skip(force=True)
@@ -335,6 +473,156 @@ class MusicBot(commands.Bot):
             logger.exception("Failed to skip stuck track guild=%s", player.guild.id)
 
         await self.refresh_controller_message(player)
+
+    async def _record_node_error(self, player: wavelink.Player) -> None:
+        """Ghi nhận lỗi từ node và xem xét chuyển node nếu lỗi quá nhiều."""
+        if not player.node:
+            return
+
+        node_id = player.node.identifier
+        now = time.monotonic()
+
+        # Reset error count nếu đã qua thời gian window
+        last_error = self._node_last_error_time.get(node_id, 0)
+        if now - last_error > self._node_error_window:
+            self._node_error_counts[node_id] = 0
+
+        # Tăng error count
+        self._node_error_counts[node_id] = self._node_error_counts.get(node_id, 0) + 1
+        self._node_last_error_time[node_id] = now
+
+        error_count = self._node_error_counts[node_id]
+        logger.debug("Node %s error count: %d/%d", node_id, error_count, self._node_error_threshold)
+
+        # Nếu vượt ngưỡng, thử chuyển sang node khác
+        if error_count >= self._node_error_threshold:
+            await self._try_switch_to_better_node(player, node_id)
+
+    async def _try_switch_to_better_node(self, player: wavelink.Player, bad_node_id: str) -> None:
+        """Thử chuyển player sang node khác tốt hơn, restore filter và queue."""
+        pool_nodes = wavelink.Pool.nodes
+
+        # Tìm node khác đang connected và có ít lỗi hơn
+        best_node: wavelink.Node | None = None
+        best_error_count = float("inf")
+
+        for node_id, node in pool_nodes.items():
+            if node_id == bad_node_id:
+                continue
+            if node.status != wavelink.NodeStatus.CONNECTED:
+                continue
+
+            node_errors = self._node_error_counts.get(node_id, 0)
+            if node_errors < best_error_count:
+                best_error_count = node_errors
+                best_node = node
+
+        if not best_node:
+            logger.warning(
+                "Node %s has too many errors but no alternative node available",
+                bad_node_id
+            )
+            return
+
+        # Reset error count của node cũ (cho lần sau)
+        self._node_error_counts[bad_node_id] = 0
+
+        guild = player.guild
+        if not guild:
+            return
+
+        channel = player.channel
+        if not channel:
+            return
+
+        logger.info(
+            "Switching player guild=%s from node %s to %s",
+            guild.id,
+            bad_node_id,
+            best_node.identifier,
+        )
+
+        # Lưu state hiện tại để restore sau khi chuyển node
+        saved_queue = list(player.queue)
+        saved_history = list(player.queue.history) if hasattr(player.queue, "history") else []
+        saved_current = player.current
+        saved_position = player.position  # ms
+        saved_volume = player.volume
+        saved_paused = player.paused
+        saved_filters = player.filters
+        saved_autoplay = player.autoplay
+        saved_queue_mode = player.queue.mode if hasattr(player.queue, "mode") else None
+
+        try:
+            # Disconnect player cũ
+            await player.disconnect()
+
+            # Đợi một chút để cleanup
+            await asyncio.sleep(0.5)
+
+            # Reconnect với node mới
+            # Wavelink tự chọn node tốt nhất từ pool, nhưng vì bad_node đã bị đánh dấu
+            # nhiều lỗi, các lần connect sau sẽ ưu tiên node khác
+            new_player: wavelink.Player = await channel.connect(cls=wavelink.Player, self_deaf=True)  # type: ignore
+
+            # Restore volume
+            await new_player.set_volume(saved_volume)
+
+            # Restore filters - Quan trọng: phải re-apply filters
+            if saved_filters:
+                try:
+                    await new_player.set_filters(saved_filters)
+                    logger.debug("Restored filters for guild=%s after node switch", guild.id)
+                except Exception:
+                    logger.exception("Failed to restore filters for guild=%s", guild.id)
+
+            # Restore autoplay mode
+            new_player.autoplay = saved_autoplay
+
+            # Restore queue mode
+            if saved_queue_mode is not None and hasattr(new_player.queue, "mode"):
+                new_player.queue.mode = saved_queue_mode
+
+            # Restore queue
+            for track in saved_queue:
+                new_player.queue.put(track)
+
+            # Restore history nếu có
+            if saved_history and hasattr(new_player.queue, "history"):
+                for track in saved_history:
+                    new_player.queue.history.put(track)
+
+            # Resume playing từ vị trí cũ
+            if saved_current:
+                await new_player.play(saved_current, start=saved_position)
+                if saved_paused:
+                    await new_player.pause(True)
+
+            # Cập nhật panel
+            await self.refresh_controller_message(new_player)
+
+            logger.info(
+                "Successfully switched player guild=%s to node %s. Queue=%d, Filters=%s",
+                guild.id,
+                best_node.identifier,
+                len(saved_queue),
+                "restored" if saved_filters else "none",
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to switch player guild=%s to new node. Attempting recovery...",
+                guild.id
+            )
+            # Thử reconnect lại với bất kỳ node nào
+            try:
+                recovery_player: wavelink.Player = await channel.connect(cls=wavelink.Player, self_deaf=True)  # type: ignore
+                await recovery_player.set_volume(saved_volume)
+                if saved_current:
+                    await recovery_player.play(saved_current)
+                await self.refresh_controller_message(recovery_player)
+            except Exception:
+                logger.exception("Recovery failed for guild=%s", guild.id)
 
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload) -> None:
         player = payload.player

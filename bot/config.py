@@ -76,8 +76,16 @@ class Config:
     discord_token: str
 
     # Cấu hình Lavalink (Music Server)
+    # primary_lavalink_node: Node đơn lẻ từ LAVALINK_HOST/PORT/... (ưu tiên dùng trước)
+    # fallback_lavalink_nodes: Danh sách nodes từ LAVALINK_NODES_JSON (dùng khi primary fail)
+    # lavalink_nodes: Tất cả nodes (primary + fallback) - giữ để backward compatible
+    primary_lavalink_node: LavalinkNodeConfig | None
+    fallback_lavalink_nodes: tuple[LavalinkNodeConfig, ...]
     lavalink_nodes: tuple[LavalinkNodeConfig, ...]
     wavelink_cache_capacity: int | None
+    lavalink_node_retries: int
+    # Thời gian (giây) kiểm tra lại primary node để chuyển về khi ổn định
+    lavalink_primary_health_interval: int
 
     # Cấu hình Bot
     dev_guild_id: int | None
@@ -136,11 +144,34 @@ def load_config() -> Config:
         raise ValueError("Missing DISCORD_TOKEN in environment")
 
     # 2. Lavalink Config
-    # Hỗ trợ multi-node qua JSON để dễ fallback khi public node chết.
+    # Chiến lược mới:
+    # - primary_node: Từ LAVALINK_HOST/PORT/PASSWORD (ưu tiên dùng trước)
+    # - fallback_nodes: Từ LAVALINK_NODES_JSON (dùng khi primary fail)
+    # - Nếu chỉ có 1 trong 2, bot vẫn hoạt động bình thường
+
+    # 2a. Load primary node từ LAVALINK_HOST/PORT/... (nếu có)
+    primary_node: LavalinkNodeConfig | None = None
+    lavalink_host = os.getenv("LAVALINK_HOST", "").strip()
+    lavalink_password = os.getenv("LAVALINK_PASSWORD", "").strip()
+
+    if lavalink_host and lavalink_password:
+        lavalink_port = _get_int("LAVALINK_PORT", 2333)
+        lavalink_secure = _get_bool("LAVALINK_SECURE", False)
+        lavalink_identifier = os.getenv("LAVALINK_IDENTIFIER", "primary").strip() or "primary"
+
+        primary_node = LavalinkNodeConfig(
+            identifier=lavalink_identifier,
+            host=lavalink_host,
+            port=lavalink_port,
+            password=lavalink_password,
+            secure=lavalink_secure,
+        )
+
+    # 2b. Load fallback nodes từ LAVALINK_NODES_JSON (nếu có)
+    fallback_nodes: list[LavalinkNodeConfig] = []
     raw_nodes_json = os.getenv("LAVALINK_NODES_JSON")
     raw_nodes_json = raw_nodes_json.strip() if raw_nodes_json and raw_nodes_json.strip() else ""
 
-    lavalink_nodes: list[LavalinkNodeConfig] = []
     if raw_nodes_json:
         try:
             data = json.loads(raw_nodes_json)
@@ -151,13 +182,17 @@ def load_config() -> Config:
             raise ValueError("LAVALINK_NODES_JSON phải là JSON array không rỗng")
 
         seen: set[str] = set()
+        # Nếu có primary node, thêm identifier vào seen để tránh trùng
+        if primary_node:
+            seen.add(primary_node.identifier)
+
         for i, item in enumerate(data, start=1):
             if not isinstance(item, dict):
                 raise ValueError(f"LAVALINK_NODES_JSON[{i}] phải là object")
 
-            identifier = str(item.get("identifier") or item.get("id") or f"node{i}").strip()
+            identifier = str(item.get("identifier") or item.get("id") or f"fallback{i}").strip()
             if not identifier:
-                identifier = f"node{i}"
+                identifier = f"fallback{i}"
 
             if identifier in seen:
                 raise ValueError(f"Trùng identifier trong LAVALINK_NODES_JSON: {identifier!r}")
@@ -195,7 +230,7 @@ def load_config() -> Config:
             if not (1 <= port <= 65535):
                 raise ValueError(f"Port không hợp lệ cho node {identifier!r}: {port}")
 
-            lavalink_nodes.append(
+            fallback_nodes.append(
                 LavalinkNodeConfig(
                     identifier=identifier,
                     host=host,
@@ -205,28 +240,34 @@ def load_config() -> Config:
                 )
             )
 
-    else:
-        lavalink_host = os.getenv("LAVALINK_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        lavalink_port = _get_int("LAVALINK_PORT", 2333)
-        lavalink_password = os.getenv("LAVALINK_PASSWORD", "").strip()
-        if not lavalink_password:
-            raise ValueError("Missing LAVALINK_PASSWORD in environment")
-
-        lavalink_secure = _get_bool("LAVALINK_SECURE", False)
-        lavalink_identifier = os.getenv("LAVALINK_IDENTIFIER", "main").strip() or "main"
-
-        lavalink_nodes.append(
-            LavalinkNodeConfig(
-                identifier=lavalink_identifier,
-                host=lavalink_host,
-                port=lavalink_port,
-                password=lavalink_password,
-                secure=lavalink_secure,
-            )
+    # 2c. Validate: phải có ít nhất 1 node (primary hoặc fallback)
+    if not primary_node and not fallback_nodes:
+        raise ValueError(
+            "Thiếu cấu hình Lavalink. Cần ít nhất 1 trong 2:\n"
+            "- LAVALINK_HOST + LAVALINK_PASSWORD (node đơn lẻ)\n"
+            "- LAVALINK_NODES_JSON (multi-node)"
         )
+
+    # 2d. Tạo danh sách tất cả nodes (primary đứng đầu để backward compatible)
+    all_nodes: list[LavalinkNodeConfig] = []
+    if primary_node:
+        all_nodes.append(primary_node)
+    all_nodes.extend(fallback_nodes)
 
     raw_cache = os.getenv("WAVELINK_CACHE_CAPACITY")
     wavelink_cache_capacity = int(raw_cache) if raw_cache and raw_cache.strip() else None
+
+    # Số lần retry khi node Lavalink không kết nối được.
+    # Public node hay chết; nếu để None (mặc định của wavelink) có thể treo startup rất lâu.
+    lavalink_node_retries = _get_int("LAVALINK_NODE_RETRIES", 2)
+    if lavalink_node_retries < 0:
+        raise ValueError("LAVALINK_NODE_RETRIES must be >= 0")
+
+    # Thời gian (giây) kiểm tra lại primary node để chuyển về khi ổn định
+    # Mặc định 120 giây (2 phút). Set 0 để tắt tính năng này.
+    lavalink_primary_health_interval = _get_int("LAVALINK_PRIMARY_HEALTH_INTERVAL", 120)
+    if lavalink_primary_health_interval < 0:
+        raise ValueError("LAVALINK_PRIMARY_HEALTH_INTERVAL must be >= 0")
 
     # 3. Bot General Config
     dev_guild_id = _get_optional_int("DEV_GUILD_ID")
@@ -259,8 +300,12 @@ def load_config() -> Config:
 
     return Config(
         discord_token=discord_token,
-        lavalink_nodes=tuple(lavalink_nodes),
+        primary_lavalink_node=primary_node,
+        fallback_lavalink_nodes=tuple(fallback_nodes),
+        lavalink_nodes=tuple(all_nodes),
         wavelink_cache_capacity=wavelink_cache_capacity,
+        lavalink_node_retries=lavalink_node_retries,
+        lavalink_primary_health_interval=lavalink_primary_health_interval,
         dev_guild_id=dev_guild_id,
         default_volume=default_volume,
         idle_timeout_seconds=idle_timeout_seconds,
@@ -274,3 +319,4 @@ def load_config() -> Config:
         support_invite_url=support_invite_url,
         vote_url=vote_url,
     )
+

@@ -29,6 +29,11 @@ File `.env` chứa các thông tin bảo mật và cấu hình quan trọng đ�
 - **LAVALINK_IDENTIFIER**: Tên định danh cho node này (để `main`).
 - **WAVELINK_CACHE_CAPACITY**: Dung lượng cache (để trống hoặc `100`).
 
+#### Lavalink nâng cao
+- **LAVALINK_NODE_RETRIES**: Số lần retry khi node Lavalink không kết nối được.
+  - `0` = thử 1 lần rồi bỏ (không treo startup)
+  - Khuyên dùng `2` cho public node để tránh treo rất lâu khi node chết.
+
 ### Bot Behavior (Hành vi)
 - **DEFAULT_VOLUME**: Âm lượng mặc định khi bot vào phòng (0-100).
 - **IDLE_TIMEOUT_SECONDS**: Thời gian bot tự thoát nếu không phát nhạc (giây). `300` = 5 phút.
