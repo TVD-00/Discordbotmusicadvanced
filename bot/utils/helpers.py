@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, cast
 
 import discord
@@ -20,6 +21,56 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+_LAVALINK_RECONNECT_LOCK = asyncio.Lock()
+_LAST_LAVALINK_RECONNECT_AT = 0.0
+
+
+async def ensure_lavalink_connected(*, timeout_s: float = 8.0, min_interval_s: float = 15.0) -> bool:
+    # Đảm bảo Lavalink có ít nhất 1 node CONNECTED.
+    #
+    # Lý do: Khi websocket Lavalink bị rớt (node CONNECTING/DISCONNECTED), thao tác join voice
+    # bằng wavelink.Player thường bị treo và timeout, khiến bot "join rồi văng".
+    #
+    # Input: timeout_s (thời gian chờ cho thao tác reconnect), min_interval_s (chống spam reconnect)
+    # Output: True nếu có node CONNECTED, False nếu chưa sẵn sàng.
+
+    import wavelink
+
+    def _has_connected_node() -> bool:
+        try:
+            nodes = wavelink.Pool.nodes
+        except Exception:
+            return False
+        return any(n.status is wavelink.NodeStatus.CONNECTED for n in nodes.values())
+
+    if _has_connected_node():
+        return True
+
+    # Thử trigger reconnect (nếu đủ thời gian giữa 2 lần thử), sau đó chờ ngắn để node lên CONNECTED.
+    global _LAST_LAVALINK_RECONNECT_AT
+
+    do_reconnect = False
+    async with _LAVALINK_RECONNECT_LOCK:
+        now = time.monotonic()
+        if now - _LAST_LAVALINK_RECONNECT_AT >= min_interval_s:
+            _LAST_LAVALINK_RECONNECT_AT = now
+            do_reconnect = True
+
+    if do_reconnect:
+        try:
+            await asyncio.wait_for(wavelink.Pool.reconnect(), timeout=timeout_s)
+        except Exception:
+            logger.exception("Failed to reconnect Lavalink pool")
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        if _has_connected_node():
+            return True
+        await asyncio.sleep(0.5)
+
+    return _has_connected_node()
 
 
 # ------------------------------------------------------------------------------
@@ -111,6 +162,11 @@ async def get_player(
     if not connect:
         return None
 
+    ok = await ensure_lavalink_connected()
+    if not ok:
+        logger.warning("Lavalink is not connected; abort voice connect guild=%s", guild.id)
+        return None
+
     # Cần kết nối mới
     vc = author_voice_channel(interaction)
     if not vc:
@@ -193,6 +249,11 @@ async def rebuild_player_session(
                 channel = member.voice.channel
 
     if channel is None:
+        return None
+
+    ok = await ensure_lavalink_connected()
+    if not ok:
+        logger.warning("Lavalink is not connected; abort rebuild session guild=%s", guild.id)
         return None
 
     saved_queue: list[wavelink.Playable] = []
@@ -327,10 +388,10 @@ async def send_response(
 
 # Giữ tên _send để tương thích với code cũ
 async def _send(interaction: discord.Interaction, content: str | None = None, *, embed: discord.Embed | None = None, ephemeral: bool = False) -> None:
-    """Wrapper cho send_response."""
+    # Wrapper cho send_response.
     await send_response(interaction, content, embed=embed, ephemeral=ephemeral)
 
 
 def _author_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | discord.StageChannel | None:
-    """Alias cho author_voice_channel để tương thích với code cũ."""
+    # Alias cho author_voice_channel để tương thích với code cũ.
     return author_voice_channel(interaction)

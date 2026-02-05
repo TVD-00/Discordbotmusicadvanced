@@ -141,6 +141,16 @@ class MetaCog(commands.Cog):
             lines.append(f"DB_PATH={getattr(config, 'db_path', None)}")
             lines.append(f"LOG_LEVEL={getattr(config, 'log_level', None)}")
 
+            nodes = getattr(config, "lavalink_nodes", None)
+            if nodes:
+                try:
+                    lines.append(f"LAVALINK_NODES={len(nodes)}")
+                    for n in nodes:
+                        # Không log password để tránh lộ thông tin nhạy cảm.
+                        lines.append(f"- {getattr(n, 'identifier', None)} {getattr(n, 'uri', None)}")
+                except Exception:
+                    pass
+
         if interaction.guild_id:
             lines.append("\n[context]")
             lines.append(f"guild_id={interaction.guild_id}")

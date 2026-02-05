@@ -43,10 +43,15 @@ from bot.utils.constants import (
     SEARCH_RATE_LIMIT_WINDOW,
 )
 from bot.utils.locks import guild_lock
-from bot.utils.helpers import rebuild_player_session
+from bot.utils.helpers import ensure_lavalink_connected, rebuild_player_session
 from bot.utils.time import format_ms, parse_time_to_ms
 
 logger = logging.getLogger(__name__)
+
+_LAVALINK_OFFLINE_NOTICE = (
+    "Máy chủ phát nhạc (Lavalink) đang offline hoặc từ chối kết nối. "
+    "Vui lòng thử lại sau hoặc đổi node."
+)
 
 # Cache lưu trạng thái vote skip: {guild_id: (track_identifier, set_of_user_ids)}
 _VOTESKIP: dict[int, tuple[str, set[int]]] = {}
@@ -56,7 +61,7 @@ _SEARCH_RATE_LIMIT: dict[int, list[float]] = {}
 
 
 def _check_rate_limit(user_id: int) -> tuple[bool, int]:
-    """Kiểm tra rate limit cho search. Trả về (allowed, remaining)."""
+    # Kiểm tra rate limit cho search. Trả về (allowed, remaining).
     import time
     now = time.time()
     
@@ -216,6 +221,15 @@ class MusicCog(commands.Cog):
         if not connect:
             return None
 
+        ok = await ensure_lavalink_connected()
+        if not ok:
+            await self._send(
+                interaction,
+                _LAVALINK_OFFLINE_NOTICE,
+                ephemeral=True,
+            )
+            return None
+
         channel = self._author_voice_channel(interaction)
         if not channel:
             await self._send(interaction, "Bạn cần vào voice channel trước.", ephemeral=True)
@@ -227,7 +241,17 @@ class MusicCog(commands.Cog):
                 timeout=VOICE_CONNECT_TIMEOUT,
             )
         except (asyncio.TimeoutError, wavelink.exceptions.ChannelTimeoutException):
-            logger.warning("Voice connect timeout guild=%s channel=%s", guild.id, channel.id)
+            try:
+                statuses = {k: v.status.name for k, v in wavelink.Pool.nodes.items()}
+            except Exception:
+                statuses = {}
+
+            logger.warning(
+                "Voice connect timeout guild=%s channel=%s nodes=%s",
+                guild.id,
+                channel.id,
+                statuses,
+            )
 
             vc = guild.voice_client
             if vc:
@@ -235,6 +259,15 @@ class MusicCog(commands.Cog):
                     await asyncio.wait_for(vc.disconnect(force=True), timeout=PLAYER_OP_TIMEOUT)
                 except Exception:
                     logger.exception("Failed to disconnect stale voice client guild=%s", guild.id)
+
+            ok = await ensure_lavalink_connected()
+            if not ok:
+                await self._send(
+                    interaction,
+                    _LAVALINK_OFFLINE_NOTICE,
+                    ephemeral=True,
+                )
+                return None
 
             try:
                 player = await asyncio.wait_for(
@@ -1563,7 +1596,7 @@ class MusicCog(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete cho command /filter - lọc theo từ khóa người dùng nhập."""
+        # Autocomplete cho command /filter - lọc theo từ khóa người dùng nhập.
         choices: list[app_commands.Choice[str]] = []
         current_lower = current.lower()
         
@@ -1590,7 +1623,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="filters", description="Xem danh sách tất cả filter có sẵn")
     @app_commands.guild_only()
     async def filters_list(self, interaction: discord.Interaction) -> None:
-        """Hiển thị danh sách tất cả filter presets."""
+        # Hiển thị danh sách tất cả filter presets.
         categories = {
             "Quality": [
                 "balanced", "studio", "clarity", "presence", "warm", "bright",
@@ -2259,6 +2292,14 @@ class SearchResultView(discord.ui.View):
             return
 
         await interaction.response.defer(thinking=True)
+
+        ok = await ensure_lavalink_connected()
+        if not ok:
+            await interaction.followup.send(
+                _LAVALINK_OFFLINE_NOTICE,
+                ephemeral=True,
+            )
+            return
 
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if not member or not member.voice or not member.voice.channel:

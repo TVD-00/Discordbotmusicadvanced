@@ -16,6 +16,12 @@ File `.env` chứa các thông tin bảo mật và cấu hình quan trọng đ�
 
 ### Lavalink (Nhạc)
 Đây là server xử lý luồng nhạc. Mặc định đã cấu hình sẵn server Public (Serenetia) nên bạn **không cần sửa** nếu không có server riêng.
+- **LAVALINK_NODES_JSON**: (Khuyên dùng nếu chạy lâu) Danh sách nhiều node Lavalink để fallback khi 1 node chết.
+  - Nếu biến này có giá trị, bot sẽ **bỏ qua** các biến `LAVALINK_HOST/PORT/PASSWORD/SECURE/IDENTIFIER` bên dưới.
+  - Giá trị là JSON array, nên bọc bằng dấu nháy đơn trong `.env`.
+  - *Ví dụ*:
+    - `LAVALINK_NODES_JSON='[{"identifier":"main","uri":"https://lavalinkv4.serenetia.com:443","password":"https://dsc.gg/ajidevserver"},{"identifier":"backup-jirayu","uri":"https://lavalink.jirayu.net:443","password":"youshallnotpass"}]'`
+  - Bạn có thể lấy thêm public node tại: https://lavalink-list.darrennathanael.com/
 - **LAVALINK_HOST**: Địa chỉ server Lavalink (VD: `lavalinkv4.serenetia.com`).
 - **LAVALINK_PORT**: Cổng kết nối (VD: `80` hoặc `2333`).
 - **LAVALINK_PASSWORD**: Mật khẩu nối tới Lavalink.

@@ -92,7 +92,7 @@ class SQLiteStorage:
         return self._path
 
     def _require_conn(self) -> aiosqlite.Connection:
-        """Helper để đảm bảo đã kết nối DB trước khi thực hiện truy vấn."""
+        # Helper để đảm bảo đã kết nối DB trước khi thực hiện truy vấn.
         if self._conn is None:
             raise RuntimeError("SQLiteStorage is not connected")
         return self._conn
@@ -102,10 +102,8 @@ class SQLiteStorage:
     # Purpose: Mở kết nối và tạo các bảng (Schema) nếu chưa tồn tại.
     # --------------------------------------------------------------------------
     async def connect(self) -> None:
-        """
-        Kết nối tới file SQLite và khởi tạo bảng nếu chưa tồn tại.
-        Nên gọi hàm này trong setup_hook của bot.
-        """
+        # Kết nối tới file SQLite và khởi tạo bảng nếu chưa tồn tại.
+        # Nên gọi hàm này trong setup_hook của bot.
         db_dir = os.path.dirname(self._path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -220,13 +218,13 @@ class SQLiteStorage:
     # Group: DB Maintenance - Tối ưu và dọn dẹp database
     # --------------------------------------------------------------------------
     async def vacuum(self) -> None:
-        """Thu gọn database, giải phóng dung lượng từ các record đã xóa."""
+        # Thu gọn database, giải phóng dung lượng từ các record đã xóa.
         conn = self._require_conn()
         # VACUUM không chạy được trong transaction, cần isolation_level=None
         await conn.execute("VACUUM")
 
     async def get_db_stats(self) -> dict[str, int]:
-        """Lấy thống kê số lượng record trong các bảng chính."""
+        # Lấy thống kê số lượng record trong các bảng chính.
         conn = self._require_conn()
         stats: dict[str, int] = {}
 
@@ -239,10 +237,8 @@ class SQLiteStorage:
         return stats
 
     async def prune_old_liked(self, max_age_days: int = DEFAULT_LIKED_TTL_DAYS) -> int:
-        """
-        Xóa các bài yêu thích cũ hơn max_age_days.
-        Trả về số record đã xóa.
-        """
+        # Xóa các bài yêu thích cũ hơn max_age_days.
+        # Trả về số record đã xóa.
         conn = self._require_conn()
         cutoff = _now_ts() - (max_age_days * 86400)
         cur = await conn.execute(
@@ -253,10 +249,8 @@ class SQLiteStorage:
         return int(cur.rowcount)
 
     async def cleanup_orphaned_guilds(self, active_guild_ids: set[int]) -> dict[str, int]:
-        """
-        Xóa dữ liệu của các guild không còn trong bot.
-        Trả về dict với số record đã xóa mỗi bảng.
-        """
+        # Xóa dữ liệu của các guild không còn trong bot.
+        # Trả về dict với số record đã xóa mỗi bảng.
         if not active_guild_ids:
             return {}
 
@@ -287,10 +281,8 @@ class SQLiteStorage:
         return deleted
 
     async def _enforce_liked_limit(self, guild_id: int, user_id: int) -> int:
-        """
-        Đảm bảo user không vượt quá MAX_LIKED_PER_USER.
-        Xóa bài cũ nhất nếu vượt quá. Trả về số bài đã xóa.
-        """
+        # Đảm bảo user không vượt quá MAX_LIKED_PER_USER.
+        # Xóa bài cũ nhất nếu vượt quá. Trả về số bài đã xóa.
         conn = self._require_conn()
 
         # Đếm số bài hiện có
@@ -322,10 +314,8 @@ class SQLiteStorage:
         return int(cur.rowcount)
 
     async def _enforce_playlist_limit(self, playlist_id: int) -> int:
-        """
-        Đảm bảo playlist không vượt quá MAX_PLAYLIST_ITEMS.
-        Xóa bài cuối nếu vượt quá. Trả về số bài đã xóa.
-        """
+        # Đảm bảo playlist không vượt quá MAX_PLAYLIST_ITEMS.
+        # Xóa bài cuối nếu vượt quá. Trả về số bài đã xóa.
         conn = self._require_conn()
 
         cur = await conn.execute(

@@ -134,17 +134,27 @@ class MusicBot(commands.Bot):
             logger.exception("DB maintenance failed (non-critical)")
 
         # 3. Kết nối Lavalink Node
-        node = wavelink.Node(
-            uri=self.config.lavalink_uri,
-            password=self.config.lavalink_password,
-            identifier=self.config.lavalink_identifier,
-        )
+        nodes: list[wavelink.Node] = []
+        for n in getattr(self.config, "lavalink_nodes", ()):  # type: ignore[attr-defined]
+            nodes.append(
+                wavelink.Node(
+                    uri=n.uri,
+                    password=n.password,
+                    identifier=n.identifier,
+                )
+            )
 
-        await wavelink.Pool.connect(
-            nodes=[node],
-            client=self,
-            cache_capacity=self.config.wavelink_cache_capacity,
-        )
+        if not nodes:
+            # Fallback an toàn (không nên xảy ra vì config đã validate)
+            nodes.append(
+                wavelink.Node(
+                    uri=self.config.lavalink_uri,
+                    password=self.config.lavalink_password,
+                    identifier=self.config.lavalink_identifier,
+                )
+            )
+
+        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=self.config.wavelink_cache_capacity)
 
         # 4. Load Extensions (Cogs)
         await self.load_extension("bot.cogs.music")

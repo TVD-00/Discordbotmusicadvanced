@@ -14,7 +14,7 @@ from __future__ import annotations
 # Thời gian chờ cho các thao tác network (giây)
 LYRICS_API_TIMEOUT = 10           # Timeout cho API lyrics.ovh
 SEARCH_TIMEOUT = 30               # Timeout cho tìm kiếm nhạc
-VOICE_CONNECT_TIMEOUT = 12        # Timeout khi join voice
+VOICE_CONNECT_TIMEOUT = 20        # Timeout khi join voice (mạng chậm dễ vượt 12s)
 PLAYER_OP_TIMEOUT = 10            # Timeout cho thao tác player (play/filter)
 
 # Thời gian delay (giây)

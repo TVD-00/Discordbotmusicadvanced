@@ -7,9 +7,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+
+
+_ERR_LAVALINK_NODES_JSON_INVALID = (
+    "LAVALINK_NODES_JSON không hợp lệ. Giá trị phải là JSON array. "
+    "Gợi ý: bọc toàn bộ bằng dấu nháy đơn trong file .env."
+)
 
 
 # ------------------------------------------------------------------------------
@@ -50,15 +58,25 @@ def _get_optional_int(name: str) -> int | None:
 # Purpose: Dataclass chứa toàn bộ thông tin cấu hình (immutable).
 # ------------------------------------------------------------------------------
 @dataclass(frozen=True)
+class LavalinkNodeConfig:
+    identifier: str
+    host: str
+    port: int
+    password: str
+    secure: bool
+
+    @property
+    def uri(self) -> str:
+        scheme = "https" if self.secure else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True)
 class Config:
     discord_token: str
 
     # Cấu hình Lavalink (Music Server)
-    lavalink_host: str
-    lavalink_port: int
-    lavalink_password: str
-    lavalink_secure: bool
-    lavalink_identifier: str
+    lavalink_nodes: tuple[LavalinkNodeConfig, ...]
     wavelink_cache_capacity: int | None
 
     # Cấu hình Bot
@@ -81,8 +99,27 @@ class Config:
 
     @property
     def lavalink_uri(self) -> str:
-        scheme = "https" if self.lavalink_secure else "http"
-        return f"{scheme}://{self.lavalink_host}:{self.lavalink_port}"
+        return self.lavalink_nodes[0].uri
+
+    @property
+    def lavalink_identifier(self) -> str:
+        return self.lavalink_nodes[0].identifier
+
+    @property
+    def lavalink_password(self) -> str:
+        return self.lavalink_nodes[0].password
+
+    @property
+    def lavalink_secure(self) -> bool:
+        return self.lavalink_nodes[0].secure
+
+    @property
+    def lavalink_host(self) -> str:
+        return self.lavalink_nodes[0].host
+
+    @property
+    def lavalink_port(self) -> int:
+        return self.lavalink_nodes[0].port
 
 
 # ------------------------------------------------------------------------------
@@ -99,14 +136,94 @@ def load_config() -> Config:
         raise ValueError("Missing DISCORD_TOKEN in environment")
 
     # 2. Lavalink Config
-    lavalink_host = os.getenv("LAVALINK_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    lavalink_port = _get_int("LAVALINK_PORT", 2333)
-    lavalink_password = os.getenv("LAVALINK_PASSWORD", "").strip()
-    if not lavalink_password:
-        raise ValueError("Missing LAVALINK_PASSWORD in environment")
+    # Hỗ trợ multi-node qua JSON để dễ fallback khi public node chết.
+    raw_nodes_json = os.getenv("LAVALINK_NODES_JSON")
+    raw_nodes_json = raw_nodes_json.strip() if raw_nodes_json and raw_nodes_json.strip() else ""
 
-    lavalink_secure = _get_bool("LAVALINK_SECURE", False)
-    lavalink_identifier = os.getenv("LAVALINK_IDENTIFIER", "main").strip() or "main"
+    lavalink_nodes: list[LavalinkNodeConfig] = []
+    if raw_nodes_json:
+        try:
+            data = json.loads(raw_nodes_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(_ERR_LAVALINK_NODES_JSON_INVALID) from e
+
+        if not isinstance(data, list) or not data:
+            raise ValueError("LAVALINK_NODES_JSON phải là JSON array không rỗng")
+
+        seen: set[str] = set()
+        for i, item in enumerate(data, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"LAVALINK_NODES_JSON[{i}] phải là object")
+
+            identifier = str(item.get("identifier") or item.get("id") or f"node{i}").strip()
+            if not identifier:
+                identifier = f"node{i}"
+
+            if identifier in seen:
+                raise ValueError(f"Trùng identifier trong LAVALINK_NODES_JSON: {identifier!r}")
+            seen.add(identifier)
+
+            password = str(item.get("password") or "").strip()
+            if not password:
+                raise ValueError(f"Thiếu password cho node {identifier!r} trong LAVALINK_NODES_JSON")
+
+            # Ưu tiên đọc uri nếu có (đỡ phải tách host/port/secure).
+            host = str(item.get("host") or "").strip()
+            port_raw = item.get("port")
+            secure_raw = item.get("secure")
+
+            uri_raw = item.get("uri") or item.get("url")
+            if uri_raw:
+                u = urlparse(str(uri_raw).strip())
+                scheme = (u.scheme or "").lower()
+                if scheme not in {"http", "https"}:
+                    raise ValueError(
+                        f"Node {identifier!r} có uri scheme không hợp lệ: {scheme!r} (chỉ hỗ trợ http/https)"
+                    )
+                secure = scheme == "https"
+                host = u.hostname or ""
+                port = u.port or (443 if secure else 80)
+            else:
+                secure = bool(secure_raw) if secure_raw is not None else False
+                try:
+                    port = int(port_raw) if port_raw is not None else 0
+                except Exception as e:
+                    raise ValueError(f"Port không hợp lệ cho node {identifier!r}: {port_raw!r}") from e
+
+            if not host:
+                raise ValueError(f"Thiếu host/uri cho node {identifier!r} trong LAVALINK_NODES_JSON")
+            if not (1 <= port <= 65535):
+                raise ValueError(f"Port không hợp lệ cho node {identifier!r}: {port}")
+
+            lavalink_nodes.append(
+                LavalinkNodeConfig(
+                    identifier=identifier,
+                    host=host,
+                    port=port,
+                    password=password,
+                    secure=secure,
+                )
+            )
+
+    else:
+        lavalink_host = os.getenv("LAVALINK_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        lavalink_port = _get_int("LAVALINK_PORT", 2333)
+        lavalink_password = os.getenv("LAVALINK_PASSWORD", "").strip()
+        if not lavalink_password:
+            raise ValueError("Missing LAVALINK_PASSWORD in environment")
+
+        lavalink_secure = _get_bool("LAVALINK_SECURE", False)
+        lavalink_identifier = os.getenv("LAVALINK_IDENTIFIER", "main").strip() or "main"
+
+        lavalink_nodes.append(
+            LavalinkNodeConfig(
+                identifier=lavalink_identifier,
+                host=lavalink_host,
+                port=lavalink_port,
+                password=lavalink_password,
+                secure=lavalink_secure,
+            )
+        )
 
     raw_cache = os.getenv("WAVELINK_CACHE_CAPACITY")
     wavelink_cache_capacity = int(raw_cache) if raw_cache and raw_cache.strip() else None
@@ -142,11 +259,7 @@ def load_config() -> Config:
 
     return Config(
         discord_token=discord_token,
-        lavalink_host=lavalink_host,
-        lavalink_port=lavalink_port,
-        lavalink_password=lavalink_password,
-        lavalink_secure=lavalink_secure,
-        lavalink_identifier=lavalink_identifier,
+        lavalink_nodes=tuple(lavalink_nodes),
         wavelink_cache_capacity=wavelink_cache_capacity,
         dev_guild_id=dev_guild_id,
         default_volume=default_volume,
@@ -161,4 +274,3 @@ def load_config() -> Config:
         support_invite_url=support_invite_url,
         vote_url=vote_url,
     )
-

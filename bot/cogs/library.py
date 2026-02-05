@@ -46,7 +46,7 @@ _PLAYLIST_CACHE: dict[tuple[int, int, str], tuple[list[wavelink.Playable], float
 
 
 def _get_cached_playlist(guild_id: int, user_id: int, name: str) -> list[wavelink.Playable] | None:
-    """Lấy playlist từ cache nếu còn hợp lệ."""
+    # Lấy playlist từ cache nếu còn hợp lệ.
     import time
     key = (guild_id, user_id, name)
     if key in _PLAYLIST_CACHE:
@@ -59,14 +59,14 @@ def _get_cached_playlist(guild_id: int, user_id: int, name: str) -> list[wavelin
 
 
 def _set_cached_playlist(guild_id: int, user_id: int, name: str, tracks: list[wavelink.Playable]) -> None:
-    """Lưu playlist vào cache."""
+    # Lưu playlist vào cache.
     import time
     key = (guild_id, user_id, name)
     _PLAYLIST_CACHE[key] = (tracks, time.time())
 
 
 def _clear_playlist_cache(guild_id: int, user_id: int, name: str) -> None:
-    """Xóa cache của playlist (dùng khi modify)."""
+    # Xóa cache của playlist (dùng khi modify).
     key = (guild_id, user_id, name)
     _PLAYLIST_CACHE.pop(key, None)
 

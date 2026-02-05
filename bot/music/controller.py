@@ -895,9 +895,8 @@ async def apply_filter_preset(bot: commands.Bot, player: wavelink.Player, preset
 # Purpose: Tạo danh sách options cho Select Menu, chia thành nhiều trang nếu cần.
 # ------------------------------------------------------------------------------
 def get_filter_options(page: int = 0, page_size: int = 25) -> list[discord.SelectOption]:
-    """Lấy danh sách filter options cho Select Menu.
-    Discord giới hạn 25 options, nên cần phân trang.
-    """
+    # Lấy danh sách filter options cho Select Menu.
+    # Discord giới hạn 25 options, nên cần phân trang.
     # Danh sách filter theo category để dễ tìm
     filter_order = [
         # Cơ bản
@@ -1019,7 +1018,7 @@ class FilterPresetSelect(discord.ui.Select):
 # Purpose: Tính tổng số trang filter dựa trên số lượng presets.
 # ------------------------------------------------------------------------------
 def get_total_filter_pages(page_size: int = 25) -> int:
-    """Tính tổng số trang cho filter menu."""
+    # Tính tổng số trang cho filter menu.
     # Lọc bỏ reset
     available = [k for k in FILTER_PRESETS.keys() if k != "reset"]
     return max(1, (len(available) + page_size - 1) // page_size)
@@ -1451,7 +1450,7 @@ class PlayerControlView(discord.ui.View):
 
     @discord.ui.button(label="Bộ lọc 1/2", style=discord.ButtonStyle.secondary, custom_id="music:filter_page", row=3)
     async def filter_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """Chuyển trang filter menu."""
+        # Chuyển trang filter menu.
         if not interaction.guild_id:
             await interaction.response.send_message("Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
