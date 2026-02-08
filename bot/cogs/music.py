@@ -43,7 +43,7 @@ from bot.utils.constants import (
     SEARCH_RATE_LIMIT_WINDOW,
 )
 from bot.utils.locks import guild_lock
-from bot.utils.helpers import ensure_lavalink_connected, rebuild_player_session
+from bot.utils.helpers import ensure_lavalink_connected, is_lavalink_node_error, rebuild_player_session
 from bot.utils.time import format_ms, parse_time_to_ms
 
 logger = logging.getLogger(__name__)
@@ -118,6 +118,12 @@ class MusicCog(commands.Cog):
         except Exception:
             if player.guild:
                 logger.exception("Failed to refresh controller message guild=%s", player.guild.id)
+
+    async def _recover_lavalink(self) -> None:
+        try:
+            await ensure_lavalink_connected(self.bot, force_reconnect=True, min_interval_s=0.0)
+        except Exception:
+            logger.exception("Failed to trigger Lavalink recovery")
 
     # --------------------------------------------------------------------------
     # Helper: _send
@@ -221,7 +227,7 @@ class MusicCog(commands.Cog):
         if not connect:
             return None
 
-        ok = await ensure_lavalink_connected()
+        ok = await ensure_lavalink_connected(self.bot)
         if not ok:
             await self._send(
                 interaction,
@@ -260,7 +266,7 @@ class MusicCog(commands.Cog):
                 except Exception:
                     logger.exception("Failed to disconnect stale voice client guild=%s", guild.id)
 
-            ok = await ensure_lavalink_connected()
+            ok = await ensure_lavalink_connected(self.bot, force_reconnect=True, min_interval_s=0.0)
             if not ok:
                 await self._send(
                     interaction,
@@ -369,6 +375,16 @@ class MusicCog(commands.Cog):
                 view=None,
             )
             return
+        except wavelink.exceptions.NodeException:
+            logger.warning(
+                "Search node error guild=%s query=%r source=%r",
+                interaction.guild_id,
+                query,
+                source,
+            )
+            await self._recover_lavalink()
+            await interaction.edit_original_response(content=_LAVALINK_OFFLINE_NOTICE, embed=None, view=None)
+            return
         except Exception:
             logger.exception(
                 "Search failed guild=%s query=%r source=%r",
@@ -433,8 +449,12 @@ class MusicCog(commands.Cog):
                             return
                         player = new_player
                         recovered = True
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed to start playback guild=%s", interaction.guild_id)
+                        if is_lavalink_node_error(exc):
+                            await self._recover_lavalink()
+                            await interaction.edit_original_response(content=_LAVALINK_OFFLINE_NOTICE, embed=None, view=None)
+                            return
                         await interaction.edit_original_response(
                             content="Không thể phát nhạc. Vui lòng thử lại.",
                             embed=None,
@@ -516,13 +536,30 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True)
+
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
                 await self._send(interaction, "Bot chưa ở trong voice channel.", ephemeral=True)
                 return
 
-            await player.disconnect()
+            try:
+                await asyncio.wait_for(player.disconnect(), timeout=PLAYER_OP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Disconnect timeout guild=%s", interaction.guild_id)
+                await self._recover_lavalink()
+                await self._send(interaction, "Disconnect bị timeout. Vui lòng thử lại.", ephemeral=True)
+                return
+            except Exception as exc:
+                logger.exception("Failed to disconnect guild=%s", interaction.guild_id)
+                if is_lavalink_node_error(exc):
+                    await self._recover_lavalink()
+                    await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+                    return
+                await self._send(interaction, "Không thể disconnect. Vui lòng thử lại.", ephemeral=True)
+                return
 
             if hasattr(self.bot, "mark_controller_message"):
                 try:
@@ -595,6 +632,11 @@ class MusicCog(commands.Cog):
             logger.warning("Search timeout guild=%s query=%r", interaction.guild_id, query)
             await self._send(interaction, "Tìm kiếm quá lâu, vui lòng thử lại.")
             return
+        except wavelink.exceptions.NodeException:
+            logger.warning("Search node error guild=%s query=%r", interaction.guild_id, query)
+            await self._recover_lavalink()
+            await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+            return
         except Exception:
             logger.exception("Search failed guild=%s query=%r", interaction.guild_id, query)
             await self._send(interaction, "Không tìm được bài hát với query này.", ephemeral=True)
@@ -653,8 +695,12 @@ class MusicCog(commands.Cog):
                         return
                     player = new_player
                     recovered = True
-                except Exception:
+                except Exception as exc:
                     logger.exception("Failed to start playback guild=%s", interaction.guild_id)
+                    if is_lavalink_node_error(exc):
+                        await self._recover_lavalink()
+                        await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+                        return
                     await self._send(interaction, "Không thể phát nhạc. Vui lòng thử lại.")
                     return
 
@@ -698,6 +744,11 @@ class MusicCog(commands.Cog):
         except asyncio.TimeoutError:
             logger.warning("Search timeout guild=%s query=%r", interaction.guild_id, query)
             await self._send(interaction, "Tìm kiếm quá lâu, vui lòng thử lại.")
+            return
+        except wavelink.exceptions.NodeException:
+            logger.warning("Search node error guild=%s query=%r", interaction.guild_id, query)
+            await self._recover_lavalink()
+            await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
             return
         except Exception:
             logger.exception("Search failed guild=%s query=%r", interaction.guild_id, query)
@@ -757,8 +808,12 @@ class MusicCog(commands.Cog):
                         return
                     player = new_player
                     recovered = True
-                except Exception:
+                except Exception as exc:
                     logger.exception("Failed to start playback guild=%s", interaction.guild_id)
+                    if is_lavalink_node_error(exc):
+                        await self._recover_lavalink()
+                        await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+                        return
                     await self._send(interaction, "Không thể phát nhạc. Vui lòng thử lại.")
                     return
 
@@ -2293,7 +2348,7 @@ class SearchResultView(discord.ui.View):
 
         await interaction.response.defer(thinking=True)
 
-        ok = await ensure_lavalink_connected()
+        ok = await ensure_lavalink_connected(self._bot)
         if not ok:
             await interaction.followup.send(
                 _LAVALINK_OFFLINE_NOTICE,
@@ -2377,8 +2432,12 @@ class SearchResultView(discord.ui.View):
                         await interaction.followup.send("Không thể phát nhạc do phiên phát bị treo.", ephemeral=True)
                         return
                     player = new_player
-                except Exception:
+                except Exception as exc:
                     logger.exception("Failed to start playback guild=%s", interaction.guild_id)
+                    if is_lavalink_node_error(exc):
+                        await ensure_lavalink_connected(self._bot, force_reconnect=True, min_interval_s=0.0)
+                        await interaction.followup.send(_LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+                        return
                     await interaction.followup.send("Không thể phát nhạc. Vui lòng thử lại.", ephemeral=True)
                     return
 

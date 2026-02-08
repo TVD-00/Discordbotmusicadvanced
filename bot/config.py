@@ -31,6 +31,22 @@ def _get_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _coerce_bool(raw: object, *, field_name: str) -> bool:
+    if isinstance(raw, bool):
+        return raw
+
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+
+    raise ValueError(f"Giá trị boolean không hợp lệ cho {field_name}: {raw!r}")
+
+
 # ------------------------------------------------------------------------------
 # Helper: _get_int
 # Purpose: Chuyển đổi giá trị string từ env thành int, có giá trị mặc định.
@@ -219,7 +235,7 @@ def load_config() -> Config:
                 host = u.hostname or ""
                 port = u.port or (443 if secure else 80)
             else:
-                secure = bool(secure_raw) if secure_raw is not None else False
+                secure = _coerce_bool(secure_raw, field_name=f"{identifier}.secure") if secure_raw is not None else False
                 try:
                     port = int(port_raw) if port_raw is not None else 0
                 except Exception as e:
@@ -319,4 +335,3 @@ def load_config() -> Config:
         support_invite_url=support_invite_url,
         vote_url=vote_url,
     )
-

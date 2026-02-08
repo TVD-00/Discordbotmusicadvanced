@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 
 import discord
 from discord import app_commands
@@ -20,6 +20,7 @@ from bot.config import Config
 from bot.music.controller import PlayerControlView, build_controller_embed
 from bot.storage.memory import GuildSettingsStore
 from bot.storage.sqlite_storage import SQLiteStorage
+from bot.utils import constants
 from bot.utils.errors import ChannelRestrictedError
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class BotCommandTree(app_commands.CommandTree):
 class MusicBot(commands.Bot):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents, tree_cls=BotCommandTree)
 
         self.config = config
@@ -95,6 +97,9 @@ class MusicBot(commands.Bot):
         self._node_error_threshold = 3  # Số lỗi tối đa trước khi chuyển node
         self._node_error_window = 60  # Giây - reset error count sau khoảng này
         self._node_last_error_time: dict[str, float] = {}
+        self._using_primary_node = False
+        self._primary_node_identifier: str | None = None
+        self._primary_health_task: asyncio.Task[None] | None = None
 
     # --------------------------------------------------------------------------
     # Method: setup_hook
@@ -160,8 +165,105 @@ class MusicBot(commands.Bot):
     # Method: _connect_lavalink_with_fallback
     # Purpose: Kết nối Lavalink theo chiến lược: primary trước, fallback sau.
     # --------------------------------------------------------------------------
+    def _connected_node_identifiers(self) -> set[str]:
+        try:
+            pool_nodes = wavelink.Pool.nodes
+        except Exception:
+            return set()
+
+        return {
+            identifier
+            for identifier, node in pool_nodes.items()
+            if node.status == wavelink.NodeStatus.CONNECTED
+        }
+
+    async def _connect_node_configs(
+        self,
+        node_configs: list[Any],
+        *,
+        reason: str,
+        retries: int | None = None,
+    ) -> set[str]:
+        if not node_configs:
+            return self._connected_node_identifiers()
+
+        pool_nodes = wavelink.Pool.nodes
+        node_retries = self.config.lavalink_node_retries if retries is None else retries
+
+        nodes_to_add: list[wavelink.Node] = []
+        has_disconnected = False
+
+        for cfg in node_configs:
+            existing = pool_nodes.get(cfg.identifier)
+            if existing is None:
+                nodes_to_add.append(
+                    wavelink.Node(
+                        uri=cfg.uri,
+                        password=cfg.password,
+                        identifier=cfg.identifier,
+                        retries=node_retries,
+                    )
+                )
+                continue
+
+            if existing.status != wavelink.NodeStatus.CONNECTED:
+                has_disconnected = True
+
+        if nodes_to_add:
+            try:
+                logger.info("Connecting %d Lavalink node(s) (%s)", len(nodes_to_add), reason)
+                await wavelink.Pool.connect(
+                    nodes=nodes_to_add,
+                    client=self,
+                    cache_capacity=self.config.wavelink_cache_capacity,
+                )
+            except Exception:
+                logger.exception("Failed to connect Lavalink node(s) (%s)", reason)
+
+        if has_disconnected:
+            try:
+                logger.info("Reconnecting disconnected Lavalink node(s) (%s)", reason)
+                await wavelink.Pool.reconnect()
+            except Exception:
+                logger.exception("Failed to reconnect Lavalink node(s) (%s)", reason)
+
+        if nodes_to_add or has_disconnected:
+            await asyncio.sleep(1)
+
+        return self._connected_node_identifiers()
+
+    async def _switch_players_to_node(self, target_node_id: str) -> int:
+        target = wavelink.Pool.nodes.get(target_node_id)
+        if target is None or target.status != wavelink.NodeStatus.CONNECTED:
+            return 0
+
+        switched = 0
+        for vc in list(self.voice_clients):
+            if not isinstance(vc, wavelink.Player):
+                continue
+
+            node = getattr(vc, "node", None)
+            if node is None or node.identifier == target_node_id:
+                continue
+
+            switch_node = getattr(vc, "switch_node", None)
+            if switch_node is None:
+                continue
+
+            try:
+                await asyncio.wait_for(switch_node(target), timeout=constants.PLAYER_OP_TIMEOUT)
+                switched += 1
+            except Exception:
+                guild_id = vc.guild.id if vc.guild else "unknown"
+                logger.exception(
+                    "Failed to switch player guild=%s to node=%s",
+                    guild_id,
+                    target_node_id,
+                )
+
+        return switched
+
     async def _connect_lavalink_with_fallback(self) -> None:
-        node_retries = self.config.lavalink_node_retries
         primary = self.config.primary_lavalink_node
         fallback_configs = self.config.fallback_lavalink_nodes
 
@@ -169,75 +271,32 @@ class MusicBot(commands.Bot):
         self._using_primary_node = False
         self._primary_node_identifier: str | None = primary.identifier if primary else None
 
-        # Chiến lược:
-        # 1. Nếu có primary node -> thử kết nối primary trước
-        # 2. Nếu primary fail hoặc không có -> dùng fallback nodes
-        # 3. Background task kiểm tra primary định kỳ để chuyển lại
-
-        nodes_to_connect: list[wavelink.Node] = []
+        connected_ids: set[str] = set()
 
         if primary:
-            # Thử kết nối primary node trước
-            primary_node = wavelink.Node(
-                uri=primary.uri,
-                password=primary.password,
-                identifier=primary.identifier,
-                retries=node_retries,
-            )
+            logger.info("Trying primary Lavalink node: %s (%s)", primary.identifier, primary.uri)
+            connected_ids = await self._connect_node_configs([primary], reason="primary")
+            self._using_primary_node = primary.identifier in connected_ids
 
-            try:
-                logger.info("Trying primary Lavalink node: %s (%s)", primary.identifier, primary.uri)
-                await wavelink.Pool.connect(
-                    nodes=[primary_node],
-                    client=self,
-                    cache_capacity=self.config.wavelink_cache_capacity,
-                )
+            if self._using_primary_node:
+                logger.info("Primary Lavalink node connected successfully: %s", primary.identifier)
+            else:
+                logger.warning("Primary Lavalink node is unavailable: %s", primary.identifier)
 
-                # Kiểm tra xem node có thực sự connected không
-                await asyncio.sleep(1)  # Cho wavelink thời gian kết nối
-                pool_nodes = wavelink.Pool.nodes
-                if primary.identifier in pool_nodes:
-                    node = pool_nodes[primary.identifier]
-                    if node.status == wavelink.NodeStatus.CONNECTED:
-                        logger.info("Primary Lavalink node connected successfully: %s", primary.identifier)
-                        self._using_primary_node = True
-                        # Khởi động health check nếu có fallback
-                        if fallback_configs:
-                            self._start_primary_health_check()
-                        return
-
-                # Primary không connected, thử fallback
-                logger.warning("Primary node %s did not connect, trying fallback nodes...", primary.identifier)
-
-            except Exception as e:
-                logger.warning("Failed to connect primary node %s: %s. Trying fallback...", primary.identifier, e)
-
-        # Fallback: kết nối tất cả fallback nodes
         if fallback_configs:
-            for n in fallback_configs:
-                nodes_to_connect.append(
-                    wavelink.Node(
-                        uri=n.uri,
-                        password=n.password,
-                        identifier=n.identifier,
-                        retries=node_retries,
-                    )
-                )
+            fallback_reason = "fallback (primary unavailable)" if not self._using_primary_node else "fallback warmup"
+            connected_ids = await self._connect_node_configs(list(fallback_configs), reason=fallback_reason)
 
-            logger.info("Connecting %d fallback Lavalink nodes...", len(nodes_to_connect))
-            await wavelink.Pool.connect(
-                nodes=nodes_to_connect,
-                client=self,
-                cache_capacity=self.config.wavelink_cache_capacity,
-            )
+        if not connected_ids:
+            raise RuntimeError("Failed to connect any Lavalink node")
 
-            # Khởi động health check để thử chuyển lại primary khi ổn định
-            if primary:
-                self._start_primary_health_check()
+        if primary and primary.identifier in connected_ids:
+            self._using_primary_node = True
 
-        elif not self._using_primary_node:
-            # Không có cả primary lẫn fallback (không nên xảy ra vì config đã validate)
-            raise RuntimeError("No Lavalink nodes configured!")
+        logger.info("Connected Lavalink nodes: %s", ", ".join(sorted(connected_ids)))
+
+        if primary and fallback_configs:
+            self._start_primary_health_check()
 
     def _start_primary_health_check(self) -> None:
         """Khởi động background task kiểm tra primary node định kỳ."""
@@ -246,64 +305,43 @@ class MusicBot(commands.Bot):
             logger.info("Primary health check disabled (interval=0)")
             return
 
+        existing_task = getattr(self, "_primary_health_task", None)
+        if existing_task and not existing_task.done():
+            return
+
         async def _health_check_loop() -> None:
             await self.wait_until_ready()
             while not self.is_closed():
                 await asyncio.sleep(interval)
 
-                if self._using_primary_node:
-                    # Đang dùng primary, không cần check
-                    continue
-
                 primary = self.config.primary_lavalink_node
                 if not primary:
                     continue
 
-                # Kiểm tra xem primary node có trong pool và connected không
-                pool_nodes = wavelink.Pool.nodes
-                if primary.identifier in pool_nodes:
-                    node = pool_nodes[primary.identifier]
-                    if node.status == wavelink.NodeStatus.CONNECTED:
-                        logger.info("Primary node %s is back online, switching...", primary.identifier)
-                        self._using_primary_node = True
-                        # Không cần làm gì thêm, wavelink tự động dùng node available
-                        continue
+                connected = self._connected_node_identifiers()
+                if primary.identifier not in connected:
+                    await self._connect_node_configs([primary], reason="primary health-check", retries=1)
+                    connected = self._connected_node_identifiers()
 
-                # Primary chưa trong pool hoặc disconnected, thử reconnect
-                try:
-                    logger.debug("Health check: trying to reconnect primary node %s", primary.identifier)
-                    primary_node = wavelink.Node(
-                        uri=primary.uri,
-                        password=primary.password,
-                        identifier=primary.identifier,
-                        retries=1,  # Chỉ thử 1 lần trong health check
+                if primary.identifier not in connected:
+                    self._using_primary_node = False
+                    logger.debug("Health check: primary node %s vẫn chưa sẵn sàng", primary.identifier)
+                    continue
+
+                switched = await self._switch_players_to_node(primary.identifier)
+                self._using_primary_node = True
+
+                if switched > 0:
+                    logger.info(
+                        "Primary node %s online, switched %d active player(s)",
+                        primary.identifier,
+                        switched,
                     )
 
-                    # Nếu node đã trong pool, thử reconnect
-                    if primary.identifier in pool_nodes:
-                        await wavelink.Pool.reconnect()
-                    else:
-                        # Node chưa trong pool, thêm mới
-                        await wavelink.Pool.connect(
-                            nodes=[primary_node],
-                            client=self,
-                            cache_capacity=self.config.wavelink_cache_capacity,
-                        )
-
-                    await asyncio.sleep(2)  # Cho wavelink thời gian kết nối
-
-                    # Kiểm tra lại
-                    pool_nodes = wavelink.Pool.nodes
-                    if primary.identifier in pool_nodes:
-                        node = pool_nodes[primary.identifier]
-                        if node.status == wavelink.NodeStatus.CONNECTED:
-                            logger.info("Primary node %s reconnected, switching back!", primary.identifier)
-                            self._using_primary_node = True
-
-                except Exception:
-                    logger.debug("Health check: primary node %s still unavailable", primary.identifier)
-
-        asyncio.create_task(_health_check_loop())
+        self._primary_health_task = asyncio.create_task(
+            _health_check_loop(),
+            name="primary-node-health-check",
+        )
 
 
     # --------------------------------------------------------------------------
@@ -402,8 +440,10 @@ class MusicBot(commands.Bot):
         disconnect_count = 0
         for vc in list(self.voice_clients):
             try:
-                await vc.disconnect(force=True)
+                await asyncio.wait_for(vc.disconnect(force=True), timeout=constants.PLAYER_OP_TIMEOUT)
                 disconnect_count += 1
+            except asyncio.TimeoutError:
+                logger.warning("Timeout disconnect voice client during shutdown")
             except Exception:
                 logger.exception("Failed to disconnect voice client during shutdown")
         
@@ -432,8 +472,14 @@ class MusicBot(commands.Bot):
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload) -> None:
         logger.info("Wavelink node ready: %r resumed=%s", payload.node, payload.resumed)
 
-    async def on_wavelink_node_disconnected(self, payload: wavelink.NodeDisconnectedEventPayload) -> None:
+        if self._primary_node_identifier and payload.node.identifier == self._primary_node_identifier:
+            self._using_primary_node = True
+
+    async def on_wavelink_node_disconnected(self, payload: Any) -> None:
         logger.warning("Wavelink node disconnected: %r", payload.node)
+
+        if self._primary_node_identifier and payload.node.identifier == self._primary_node_identifier:
+            self._using_primary_node = False
 
     async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload) -> None:
         player = payload.player
@@ -542,9 +588,33 @@ class MusicBot(commands.Bot):
             best_node.identifier,
         )
 
+        switch_node = getattr(player, "switch_node", None)
+        if switch_node is not None:
+            try:
+                await asyncio.wait_for(switch_node(best_node), timeout=constants.PLAYER_OP_TIMEOUT)
+                await self.refresh_controller_message(player)
+                logger.info(
+                    "Switched player guild=%s to node %s via switch_node",
+                    guild.id,
+                    best_node.identifier,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "switch_node failed guild=%s -> %s, fallback to rebuild",
+                    guild.id,
+                    best_node.identifier,
+                )
+
         # Lưu state hiện tại để restore sau khi chuyển node
         saved_queue = list(player.queue)
-        saved_history = list(player.queue.history) if hasattr(player.queue, "history") else []
+        history_queue = player.queue.history if hasattr(player.queue, "history") else None
+        saved_history: list[wavelink.Playable] = []
+        if history_queue is not None:
+            try:
+                saved_history = list(cast(Any, history_queue))
+            except Exception:
+                saved_history = []
         saved_current = player.current
         saved_position = player.position  # ms
         saved_volume = player.volume
@@ -555,7 +625,7 @@ class MusicBot(commands.Bot):
 
         try:
             # Disconnect player cũ
-            await player.disconnect()
+            await asyncio.wait_for(player.disconnect(), timeout=constants.PLAYER_OP_TIMEOUT)
 
             # Đợi một chút để cleanup
             await asyncio.sleep(0.5)
@@ -563,7 +633,10 @@ class MusicBot(commands.Bot):
             # Reconnect với node mới
             # Wavelink tự chọn node tốt nhất từ pool, nhưng vì bad_node đã bị đánh dấu
             # nhiều lỗi, các lần connect sau sẽ ưu tiên node khác
-            new_player: wavelink.Player = await channel.connect(cls=wavelink.Player, self_deaf=True)  # type: ignore
+            new_player: wavelink.Player = await asyncio.wait_for(
+                channel.connect(cls=wavelink.Player, self_deaf=True),  # type: ignore[arg-type]
+                timeout=constants.VOICE_CONNECT_TIMEOUT,
+            )
 
             # Restore volume
             await new_player.set_volume(saved_volume)
@@ -588,9 +661,10 @@ class MusicBot(commands.Bot):
                 new_player.queue.put(track)
 
             # Restore history nếu có
-            if saved_history and hasattr(new_player.queue, "history"):
+            restored_history = new_player.queue.history if hasattr(new_player.queue, "history") else None
+            if saved_history and restored_history is not None:
                 for track in saved_history:
-                    new_player.queue.history.put(track)
+                    cast(Any, restored_history).put(track)
 
             # Resume playing từ vị trí cũ
             if saved_current:
@@ -616,10 +690,16 @@ class MusicBot(commands.Bot):
             )
             # Thử reconnect lại với bất kỳ node nào
             try:
-                recovery_player: wavelink.Player = await channel.connect(cls=wavelink.Player, self_deaf=True)  # type: ignore
+                recovery_player: wavelink.Player = await asyncio.wait_for(
+                    channel.connect(cls=wavelink.Player, self_deaf=True),  # type: ignore[arg-type]
+                    timeout=constants.VOICE_CONNECT_TIMEOUT,
+                )
                 await recovery_player.set_volume(saved_volume)
                 if saved_current:
-                    await recovery_player.play(saved_current)
+                    await asyncio.wait_for(
+                        recovery_player.play(saved_current),
+                        timeout=constants.PLAYER_OP_TIMEOUT,
+                    )
                 await self.refresh_controller_message(recovery_player)
             except Exception:
                 logger.exception("Recovery failed for guild=%s", guild.id)

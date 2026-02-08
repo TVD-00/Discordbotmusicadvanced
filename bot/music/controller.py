@@ -1160,18 +1160,32 @@ class PlayerControlView(discord.ui.View):
         if not await _ensure_same_channel(interaction, player):
             return
 
+        await interaction.response.defer()
+
         async with guild_lock(interaction.guild_id):
             try:
-                await player.disconnect()
+                await asyncio.wait_for(player.disconnect(), timeout=PLAYER_OP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Disconnect timeout guild=%s", interaction.guild_id)
+                await interaction.followup.send("Disconnect bị timeout. Vui lòng thử lại.", ephemeral=True)
+                return
             except Exception:
                 logger.exception("Failed disconnect guild=%s", interaction.guild_id)
-                await interaction.response.send_message("Không thể disconnect.", ephemeral=True)
+                await interaction.followup.send("Không thể disconnect.", ephemeral=True)
                 return
 
-        await interaction.response.edit_message(
-            embed=discord.Embed(title="Trình phát nhạc", description="Đã rời kênh thoại."),
-            view=None,
-        )
+        payload = {
+            "embed": discord.Embed(title="Trình phát nhạc", description="Đã rời kênh thoại."),
+            "view": None,
+        }
+
+        try:
+            if interaction.message:
+                await interaction.message.edit(**payload)
+            else:
+                await interaction.edit_original_response(**payload)
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(label="Hàng đợi", style=discord.ButtonStyle.secondary, custom_id="music:queue", row=0)
     async def queue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:

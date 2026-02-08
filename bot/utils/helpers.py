@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import discord
 from discord.ext import commands
@@ -27,13 +27,41 @@ _LAVALINK_RECONNECT_LOCK = asyncio.Lock()
 _LAST_LAVALINK_RECONNECT_AT = 0.0
 
 
-async def ensure_lavalink_connected(*, timeout_s: float = 8.0, min_interval_s: float = 15.0) -> bool:
+def is_lavalink_node_error(exc: BaseException) -> bool:
+    # Nhận diện nhanh các lỗi transport/node từ Lavalink để kích hoạt fallback.
+    import aiohttp
+    import wavelink
+
+    if isinstance(exc, wavelink.exceptions.NodeException):
+        return True
+    if isinstance(exc, aiohttp.ClientError):
+        return True
+
+    msg = str(exc).lower()
+    if "nodeexception" in msg:
+        return True
+    if "unexpected mimetype" in msg:
+        return True
+    if "status code: 502" in msg or " 502" in msg:
+        return True
+
+    return False
+
+
+async def ensure_lavalink_connected(
+    bot: commands.Bot | None = None,
+    *,
+    timeout_s: float = 8.0,
+    min_interval_s: float = 15.0,
+    force_reconnect: bool = False,
+) -> bool:
     # Đảm bảo Lavalink có ít nhất 1 node CONNECTED.
     #
     # Lý do: Khi websocket Lavalink bị rớt (node CONNECTING/DISCONNECTED), thao tác join voice
     # bằng wavelink.Player thường bị treo và timeout, khiến bot "join rồi văng".
     #
-    # Input: timeout_s (thời gian chờ cho thao tác reconnect), min_interval_s (chống spam reconnect)
+    # Input: timeout_s (thời gian chờ reconnect), min_interval_s (chống spam reconnect),
+    #        force_reconnect (ép reconnect ngay), bot (để nạp thêm fallback node nếu thiếu).
     # Output: True nếu có node CONNECTED, False nếu chưa sẵn sàng.
 
     import wavelink
@@ -45,16 +73,82 @@ async def ensure_lavalink_connected(*, timeout_s: float = 8.0, min_interval_s: f
             return False
         return any(n.status is wavelink.NodeStatus.CONNECTED for n in nodes.values())
 
+    async def _connect_missing_nodes_from_config() -> None:
+        if bot is None:
+            return
+
+        config = getattr(bot, "config", None)
+        if config is None:
+            return
+
+        configured_raw = getattr(config, "lavalink_nodes", None)
+        if not isinstance(configured_raw, (tuple, list)) or not configured_raw:
+            return
+        configured_nodes = cast(list[Any], list(configured_raw))
+
+        pool_nodes = wavelink.Pool.nodes
+        retries = int(getattr(config, "lavalink_node_retries", 0))
+        cache_capacity = getattr(config, "wavelink_cache_capacity", None)
+
+        missing_nodes: list[wavelink.Node] = []
+        has_disconnected = False
+
+        for node_cfg in configured_nodes:
+            existing = pool_nodes.get(node_cfg.identifier)
+            if existing is None:
+                missing_nodes.append(
+                    wavelink.Node(
+                        uri=node_cfg.uri,
+                        password=node_cfg.password,
+                        identifier=node_cfg.identifier,
+                        retries=retries,
+                    )
+                )
+                continue
+
+            if existing.status is not wavelink.NodeStatus.CONNECTED:
+                has_disconnected = True
+
+        if missing_nodes:
+            try:
+                await asyncio.wait_for(
+                    wavelink.Pool.connect(
+                        nodes=missing_nodes,
+                        client=bot,
+                        cache_capacity=cache_capacity,
+                    ),
+                    timeout=timeout_s,
+                )
+                logger.info(
+                    "Added %d missing Lavalink node(s) from config",
+                    len(missing_nodes),
+                )
+            except Exception:
+                logger.exception("Failed to connect missing Lavalink nodes")
+
+        if has_disconnected and not _has_connected_node():
+            try:
+                await asyncio.wait_for(wavelink.Pool.reconnect(), timeout=timeout_s)
+            except Exception:
+                logger.exception("Failed to reconnect existing Lavalink nodes")
+
     if _has_connected_node():
         return True
 
     # Thử trigger reconnect (nếu đủ thời gian giữa 2 lần thử), sau đó chờ ngắn để node lên CONNECTED.
     global _LAST_LAVALINK_RECONNECT_AT
 
-    do_reconnect = False
+    do_reconnect = force_reconnect
     async with _LAVALINK_RECONNECT_LOCK:
+        if _has_connected_node():
+            return True
+
+        await _connect_missing_nodes_from_config()
+        if _has_connected_node():
+            return True
+
         now = time.monotonic()
-        if now - _LAST_LAVALINK_RECONNECT_AT >= min_interval_s:
+        if force_reconnect or now - _LAST_LAVALINK_RECONNECT_AT >= min_interval_s:
             _LAST_LAVALINK_RECONNECT_AT = now
             do_reconnect = True
 
@@ -162,7 +256,8 @@ async def get_player(
     if not connect:
         return None
 
-    ok = await ensure_lavalink_connected()
+    bot = interaction.client if isinstance(interaction.client, commands.Bot) else None
+    ok = await ensure_lavalink_connected(bot)
     if not ok:
         logger.warning("Lavalink is not connected; abort voice connect guild=%s", guild.id)
         return None
@@ -251,7 +346,7 @@ async def rebuild_player_session(
     if channel is None:
         return None
 
-    ok = await ensure_lavalink_connected()
+    ok = await ensure_lavalink_connected(bot)
     if not ok:
         logger.warning("Lavalink is not connected; abort rebuild session guild=%s", guild.id)
         return None
