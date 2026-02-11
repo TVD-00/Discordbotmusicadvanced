@@ -26,9 +26,10 @@ def parse_time_to_ms(value: str) -> int:
         else:
             raise ValueError("bad format")
 
-        if m < 0 or s < 0 or s >= 60:
+        if h < 0 or m < 0 or s < 0 or s >= 60:
             raise ValueError("bad time")
-        if h < 0:
+        # Trong format hh:mm:ss, phút phải < 60
+        if len(parts) == 3 and m >= 60:
             raise ValueError("bad time")
 
         return ((h * 3600) + (m * 60) + s) * 1000

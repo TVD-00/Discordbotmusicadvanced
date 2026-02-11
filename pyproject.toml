@@ -9,6 +9,7 @@ dependencies = [
   "wavelink>=3.5,<4",
   "python-dotenv>=1.0,<2",
   "aiosqlite>=0.20,<1",
+  "aiohttp>=3.9,<4",
 ]
 
 [project.optional-dependencies]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import discord
 from discord import app_commands
@@ -46,21 +47,23 @@ _PLAYLIST_CACHE: dict[tuple[int, int, str], tuple[list[wavelink.Playable], float
 
 
 def _get_cached_playlist(guild_id: int, user_id: int, name: str) -> list[wavelink.Playable] | None:
-    # Lấy playlist từ cache nếu còn hợp lệ.
-    import time
+    # Lấy playlist từ cache nếu còn hợp lệ + dọn dẹp entry hết hạn.
+    now = time.time()
     key = (guild_id, user_id, name)
-    if key in _PLAYLIST_CACHE:
-        tracks, timestamp = _PLAYLIST_CACHE[key]
-        if time.time() - timestamp < PLAYLIST_CACHE_TTL_SECONDS:
-            return tracks
-        # Cache hết hạn, xóa đi
-        del _PLAYLIST_CACHE[key]
+
+    # Dọn dẹp toàn bộ entry hết hạn để tránh memory leak
+    expired = [k for k, (_, ts) in _PLAYLIST_CACHE.items() if now - ts >= PLAYLIST_CACHE_TTL_SECONDS]
+    for k in expired:
+        del _PLAYLIST_CACHE[k]
+
+    cached = _PLAYLIST_CACHE.get(key)
+    if cached is not None:
+        return cached[0]
     return None
 
 
 def _set_cached_playlist(guild_id: int, user_id: int, name: str, tracks: list[wavelink.Playable]) -> None:
     # Lưu playlist vào cache.
-    import time
     key = (guild_id, user_id, name)
     _PLAYLIST_CACHE[key] = (tracks, time.time())
 

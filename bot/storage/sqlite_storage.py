@@ -228,9 +228,13 @@ class SQLiteStorage:
         conn = self._require_conn()
         stats: dict[str, int] = {}
 
-        for table in ["guild_settings", "allowed_channels", "command_restrictions",
-                      "liked_tracks", "playlists", "playlist_items"]:
-            cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+        # Whitelist tên bảng để tránh SQL injection (dù hiện tại là hardcoded)
+        _VALID_TABLES = frozenset({
+            "guild_settings", "allowed_channels", "command_restrictions",
+            "liked_tracks", "playlists", "playlist_items",
+        })
+        for table in _VALID_TABLES:
+            cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608 -- tên bảng đã whitelist
             row = await cur.fetchone()
             stats[table] = int(row[0]) if row else 0
 
@@ -262,10 +266,11 @@ class SQLiteStorage:
         guild_list = tuple(active_guild_ids)
 
         # Xóa từ các bảng có guild_id
-        tables = ["guild_settings", "allowed_channels", "command_restrictions", "liked_tracks"]
-        for table in tables:
+        # Whitelist tên bảng để tránh SQL injection (dù hiện tại là hardcoded)
+        _CLEANUP_TABLES = ("guild_settings", "allowed_channels", "command_restrictions", "liked_tracks")
+        for table in _CLEANUP_TABLES:
             cur = await conn.execute(
-                f"DELETE FROM {table} WHERE guild_id NOT IN ({placeholders})",
+                f"DELETE FROM {table} WHERE guild_id NOT IN ({placeholders})",  # noqa: S608 -- tên bảng đã whitelist
                 guild_list,
             )
             deleted[table] = int(cur.rowcount)

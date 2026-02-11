@@ -55,7 +55,10 @@ def _get_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} phải là số nguyên hợp lệ, nhận được: {raw!r}")
 
 
 # ------------------------------------------------------------------------------
@@ -123,26 +126,38 @@ class Config:
 
     @property
     def lavalink_uri(self) -> str:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].uri
 
     @property
     def lavalink_identifier(self) -> str:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].identifier
 
     @property
     def lavalink_password(self) -> str:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].password
 
     @property
     def lavalink_secure(self) -> bool:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].secure
 
     @property
     def lavalink_host(self) -> str:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].host
 
     @property
     def lavalink_port(self) -> int:
+        if not self.lavalink_nodes:
+            raise RuntimeError("Không có Lavalink node nào được cấu hình")
         return self.lavalink_nodes[0].port
 
 

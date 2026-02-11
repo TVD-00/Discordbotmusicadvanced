@@ -14,6 +14,8 @@ from discord import app_commands
 from discord.ext import commands
 import wavelink
 
+from bot.utils.helpers import is_admin
+
 
 # ------------------------------------------------------------------------------
 # Class: MetaCog
@@ -122,6 +124,10 @@ class MetaCog(commands.Cog):
     @app_commands.command(name="debug", description="Thu thập dữ liệu lỗi để báo cáo")
     @app_commands.guild_only()
     async def debug(self, interaction: discord.Interaction) -> None:
+        if not is_admin(interaction):
+            await self._send(interaction, "Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+            return
+
         lines: list[str] = []
         lines.append(f"platform={platform.platform()}")
         lines.append(f"python={platform.python_version()}")

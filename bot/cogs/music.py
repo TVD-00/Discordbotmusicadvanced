@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import io
 import math
+import time
 import urllib.parse
 from typing import cast
 
@@ -56,28 +58,38 @@ _LAVALINK_OFFLINE_NOTICE = (
 # Cache lưu trạng thái vote skip: {guild_id: (track_identifier, set_of_user_ids)}
 _VOTESKIP: dict[int, tuple[str, set[int]]] = {}
 
+
+def cleanup_voteskip(guild_id: int) -> None:
+    """Dọn dẹp vote skip khi track thay đổi."""
+    _VOTESKIP.pop(guild_id, None)
+
+
 # Rate limiting đơn giản cho search: {user_id: [(timestamp)]}
 _SEARCH_RATE_LIMIT: dict[int, list[float]] = {}
 
 
 def _check_rate_limit(user_id: int) -> tuple[bool, int]:
     # Kiểm tra rate limit cho search. Trả về (allowed, remaining).
-    import time
     now = time.time()
-    
+    window_start = now - SEARCH_RATE_LIMIT_WINDOW
+
+    # Dọn dẹp entry hết hạn của tất cả user để tránh memory leak
+    stale_keys = [uid for uid, ts in _SEARCH_RATE_LIMIT.items() if ts[-1] < window_start]
+    for uid in stale_keys:
+        del _SEARCH_RATE_LIMIT[uid]
+
     if user_id not in _SEARCH_RATE_LIMIT:
         _SEARCH_RATE_LIMIT[user_id] = []
-    
+
     # Xóa các request cũ hơn window
-    window_start = now - SEARCH_RATE_LIMIT_WINDOW
     _SEARCH_RATE_LIMIT[user_id] = [t for t in _SEARCH_RATE_LIMIT[user_id] if t > window_start]
-    
+
     current_count = len(_SEARCH_RATE_LIMIT[user_id])
     remaining = max(0, SEARCH_RATE_LIMIT_COUNT - current_count)
-    
+
     if current_count >= SEARCH_RATE_LIMIT_COUNT:
         return False, 0
-    
+
     # Thêm request hiện tại
     _SEARCH_RATE_LIMIT[user_id].append(now)
     return True, remaining - 1
@@ -302,7 +314,9 @@ class MusicCog(commands.Cog):
         player.inactive_timeout = config.idle_timeout_seconds
 
         try:
-            await player.set_volume(settings.volume_default)
+            await asyncio.wait_for(player.set_volume(settings.volume_default), timeout=PLAYER_OP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("set_volume timeout guild=%s (non-critical, dùng volume mặc định)", guild.id)
         except Exception:
             logger.exception("Failed to set initial volume guild=%s", guild.id)
 
@@ -496,6 +510,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             channel = self._author_voice_channel(interaction)
             if not channel:
@@ -598,6 +614,86 @@ class MusicCog(commands.Cog):
     # ==========================================================================
     # COMMANDS: Playback (Play/Pause/Stop/Skip)
     # ==========================================================================
+    async def _enqueue_and_respond(
+        self,
+        interaction: discord.Interaction,
+        results: wavelink.Search,
+        requester: discord.Member,
+    ) -> None:
+        """Logic chung cho play/playfile: enqueue kết quả, start playback, trả response."""
+        notice: str | None = None
+        recovered = False
+
+        async with guild_lock(interaction.guild_id):  # type: ignore[arg-type]
+            player = await self._get_player(interaction, connect=True)
+            if not player:
+                return
+
+            if not await self._ensure_same_channel(interaction, player):
+                return
+
+            if interaction.channel:
+                setattr(player, "home", interaction.channel)
+
+            extras = {
+                "requester_id": requester.id,
+                "requester_name": requester.display_name,
+            }
+
+            if isinstance(results, wavelink.Playlist):
+                results.extras = extras
+                added = await player.queue.put_wait(results)
+                notice = f"Đã thêm playlist '{results.name}' ({added} bài) vào hàng đợi."
+            else:
+                track = results[0]
+                track.extras = extras
+                await player.queue.put_wait(track)
+                notice = f"Đã thêm '{track.title}' vào hàng đợi."
+
+            if not player.playing:
+                try:
+                    next_track = player.queue.get()
+                except wavelink.QueueEmpty:
+                    return
+
+                settings = self._settings(interaction.guild_id)  # type: ignore[arg-type]
+                try:
+                    await asyncio.wait_for(
+                        player.play(next_track, volume=settings.volume_default),
+                        timeout=PLAYER_OP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Play timeout guild=%s", interaction.guild_id)
+                    new_player = await rebuild_player_session(self.bot, interaction, old=player)
+                    if not new_player:
+                        await self._send(interaction, "Không thể phát nhạc do phiên phát bị treo.")
+                        return
+                    player = new_player
+                    recovered = True
+                except Exception as exc:
+                    logger.exception("Failed to start playback guild=%s", interaction.guild_id)
+                    if is_lavalink_node_error(exc):
+                        await self._recover_lavalink()
+                        await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
+                        return
+                    await self._send(interaction, "Không thể phát nhạc. Vui lòng thử lại.")
+                    return
+
+        if recovered:
+            extra = "Đã khởi tạo lại phiên phát nhạc do treo."
+            notice = f"{notice}\n{extra}" if notice else extra
+
+        embed = build_controller_embed(self.bot, player, notice=notice)
+        settings = self._settings(interaction.guild_id)  # type: ignore[arg-type]
+        view = PlayerControlView(self.bot) if settings.buttons_enabled else None
+        message = await interaction.edit_original_response(embed=embed, view=view)
+        try:
+            channel_id = interaction.channel_id
+            if channel_id is not None:
+                getattr(self.bot, "controller_messages")[interaction.guild_id] = (channel_id, message.id)
+        except Exception:
+            logger.warning("Failed to save controller_messages ref guild=%s", interaction.guild_id)
+
     @app_commands.command(name="play", description="Phát nhạc theo tên bài hát hoặc đường dẫn (URL)")
     @app_commands.describe(query="Từ khóa hoặc URL")
     @app_commands.guild_only()
@@ -646,78 +742,7 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Không tìm thấy kết quả.", ephemeral=True)
             return
 
-        notice: str | None = None
-        recovered = False
-
-        async with guild_lock(interaction.guild_id):
-            player = await self._get_player(interaction, connect=True)
-            if not player:
-                return
-
-            if not await self._ensure_same_channel(interaction, player):
-                return
-
-            if interaction.channel:
-                setattr(player, "home", interaction.channel)
-
-            extras = {
-                "requester_id": requester.id,
-                "requester_name": requester.display_name,
-            }
-
-            if isinstance(results, wavelink.Playlist):
-                results.extras = extras
-                added = await player.queue.put_wait(results)
-                notice = f"Đã thêm playlist '{results.name}' ({added} bài) vào hàng đợi."
-            else:
-                track = results[0]
-                track.extras = extras
-                await player.queue.put_wait(track)
-                notice = f"Đã thêm '{track.title}' vào hàng đợi."
-
-            if not player.playing:
-                try:
-                    next_track = player.queue.get()
-                except wavelink.QueueEmpty:
-                    return
-
-                settings = self._settings(interaction.guild_id)
-                try:
-                    await asyncio.wait_for(
-                        player.play(next_track, volume=settings.volume_default),
-                        timeout=PLAYER_OP_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("Play timeout guild=%s", interaction.guild_id)
-                    new_player = await rebuild_player_session(self.bot, interaction, old=player)
-                    if not new_player:
-                        await self._send(interaction, "Không thể phát nhạc do phiên phát bị treo.")
-                        return
-                    player = new_player
-                    recovered = True
-                except Exception as exc:
-                    logger.exception("Failed to start playback guild=%s", interaction.guild_id)
-                    if is_lavalink_node_error(exc):
-                        await self._recover_lavalink()
-                        await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
-                        return
-                    await self._send(interaction, "Không thể phát nhạc. Vui lòng thử lại.")
-                    return
-
-        if recovered:
-            extra = "Đã khởi tạo lại phiên phát nhạc do treo."
-            notice = f"{notice}\n{extra}" if notice else extra
-
-        embed = build_controller_embed(self.bot, player, notice=notice)
-        settings = self._settings(interaction.guild_id)
-        view = PlayerControlView(self.bot) if settings.buttons_enabled else None
-        message = await interaction.edit_original_response(embed=embed, view=view)
-        try:
-            channel_id = interaction.channel_id
-            if channel_id is not None:
-                getattr(self.bot, "controller_messages")[interaction.guild_id] = (channel_id, message.id)
-        except Exception:
-            pass
+        await self._enqueue_and_respond(interaction, results, requester)
 
     @app_commands.command(name="playfile", description="Phát nhạc từ tệp đính kèm")
     @app_commands.describe(file="File đính kèm")
@@ -759,78 +784,7 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Không tìm thấy kết quả.", ephemeral=True)
             return
 
-        notice: str | None = None
-        recovered = False
-
-        async with guild_lock(interaction.guild_id):
-            player = await self._get_player(interaction, connect=True)
-            if not player:
-                return
-
-            if not await self._ensure_same_channel(interaction, player):
-                return
-
-            if interaction.channel:
-                setattr(player, "home", interaction.channel)
-
-            extras = {
-                "requester_id": requester.id,
-                "requester_name": requester.display_name,
-            }
-
-            if isinstance(results, wavelink.Playlist):
-                results.extras = extras
-                added = await player.queue.put_wait(results)
-                notice = f"Đã thêm playlist '{results.name}' ({added} bài) vào hàng đợi."
-            else:
-                track = results[0]
-                track.extras = extras
-                await player.queue.put_wait(track)
-                notice = f"Đã thêm '{track.title}' vào hàng đợi."
-
-            if not player.playing:
-                try:
-                    next_track = player.queue.get()
-                except wavelink.QueueEmpty:
-                    return
-
-                settings = self._settings(interaction.guild_id)
-                try:
-                    await asyncio.wait_for(
-                        player.play(next_track, volume=settings.volume_default),
-                        timeout=PLAYER_OP_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("Play timeout guild=%s", interaction.guild_id)
-                    new_player = await rebuild_player_session(self.bot, interaction, old=player)
-                    if not new_player:
-                        await self._send(interaction, "Không thể phát nhạc do phiên phát bị treo.")
-                        return
-                    player = new_player
-                    recovered = True
-                except Exception as exc:
-                    logger.exception("Failed to start playback guild=%s", interaction.guild_id)
-                    if is_lavalink_node_error(exc):
-                        await self._recover_lavalink()
-                        await self._send(interaction, _LAVALINK_OFFLINE_NOTICE, ephemeral=True)
-                        return
-                    await self._send(interaction, "Không thể phát nhạc. Vui lòng thử lại.")
-                    return
-
-        if recovered:
-            extra = "Đã khởi tạo lại phiên phát nhạc do treo."
-            notice = f"{notice}\n{extra}" if notice else extra
-
-        embed = build_controller_embed(self.bot, player, notice=notice)
-        settings = self._settings(interaction.guild_id)
-        view = PlayerControlView(self.bot) if settings.buttons_enabled else None
-        message = await interaction.edit_original_response(embed=embed, view=view)
-        try:
-            channel_id = interaction.channel_id
-            if channel_id is not None:
-                getattr(self.bot, "controller_messages")[interaction.guild_id] = (channel_id, message.id)
-        except Exception:
-            pass
+        await self._enqueue_and_respond(interaction, results, requester)
 
     @app_commands.command(name="search", description="Tìm kiếm bài hát")
     @app_commands.describe(query="Từ khóa hoặc URL")
@@ -869,6 +823,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.playing:
@@ -886,6 +842,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.playing:
@@ -907,6 +865,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -930,6 +890,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.playing or not player.current:
@@ -949,6 +911,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -981,7 +945,7 @@ class MusicCog(commands.Cog):
                     await self._send(interaction, "Hàng đợi đang trống.", ephemeral=True)
                     return
 
-                idx = int(index) - 1
+                idx = index - 1
                 if idx < 0 or idx >= len(player.queue):
                     await self._send(interaction, "Index không hợp lệ.", ephemeral=True)
                     return
@@ -1041,6 +1005,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -1074,15 +1040,22 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
-        value = max(0, min(int(value), 100))
+        value = max(0, min(value, 100))
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
                 await self._send(interaction, "Bot chưa ở trong voice channel.", ephemeral=True)
                 return
 
-            await player.set_volume(value)
+            try:
+                await asyncio.wait_for(player.set_volume(value), timeout=PLAYER_OP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("set_volume timeout guild=%s", interaction.guild_id)
+                await self._send(interaction, "Chỉnh âm lượng bị timeout. Vui lòng thử lại.", ephemeral=True)
+                return
             await self._refresh_controller(player)
             await self._send(interaction, f"Đã chỉnh âm lượng: {value}.")
 
@@ -1093,6 +1066,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -1154,8 +1129,6 @@ class MusicCog(commands.Cog):
             await interaction.edit_original_response(content=f"```\n{text}\n```")
             return
 
-        import io
-
         fp = io.BytesIO(text.encode("utf-8"))
         fp.seek(0)
         file = discord.File(fp, filename="lyrics.txt")
@@ -1169,6 +1142,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1215,6 +1190,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1225,7 +1202,7 @@ class MusicCog(commands.Cog):
                 await self._send(interaction, "Hàng đợi đang trống.", ephemeral=True)
                 return
 
-            idx = int(index) - 1
+            idx = index - 1
             if idx < 0 or idx >= len(player.queue):
                 await self._send(interaction, "Index không hợp lệ.", ephemeral=True)
                 return
@@ -1247,6 +1224,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1257,8 +1236,8 @@ class MusicCog(commands.Cog):
                 await self._send(interaction, "Hàng đợi đang trống.", ephemeral=True)
                 return
 
-            src = int(from_index) - 1
-            dst = int(to_index) - 1
+            src = from_index - 1
+            dst = to_index - 1
 
             if src < 0 or src >= len(player.queue) or dst < 0 or dst >= len(player.queue):
                 await self._send(interaction, "Index không hợp lệ.", ephemeral=True)
@@ -1281,6 +1260,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1298,6 +1279,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1330,6 +1313,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Mode không hợp lệ: off | track | queue", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1379,7 +1364,7 @@ class MusicCog(commands.Cog):
             await self._refresh_controller(player)
         await self._send(interaction, f"Chế độ 24/7 đã {'bật' if mode == 'on' else 'tắt'}.")
 
-    @app_commands.command(name="forcefix", description="Sửa lỗi player (tham gia lại kênh)")
+    @app_commands.command(name="forcefix", description="Sửa lỗi player (chuyển node, reset filters, tham gia lại kênh)")
     @app_commands.guild_only()
     async def forcefix(self, interaction: discord.Interaction) -> None:
         if not interaction.guild_id:
@@ -1399,7 +1384,44 @@ class MusicCog(commands.Cog):
                 await self._send(interaction, "Bạn cần vào voice channel trước.", ephemeral=True)
                 return
 
-            player = await rebuild_player_session(self.bot, interaction, channel=channel)
+            # Xác định node hiện tại để chọn node khác
+            old_node_id: str | None = None
+            old_vc = interaction.guild.voice_client if interaction.guild else None
+            if isinstance(old_vc, wavelink.Player) and old_vc.node:
+                old_node_id = old_vc.node.identifier
+
+            # Tìm node khác node hiện tại (ưu tiên node ít lỗi nhất)
+            preferred: wavelink.Node | None = None
+            pool_nodes = wavelink.Pool.nodes
+            if len(pool_nodes) >= 2 and old_node_id:
+                best_errors = float("inf")
+                error_counts: dict[str, int] = getattr(self.bot, "_node_error_counts", {})
+                for nid, node in pool_nodes.items():
+                    if nid == old_node_id:
+                        continue
+                    if node.status != wavelink.NodeStatus.CONNECTED:
+                        continue
+                    n_err = error_counts.get(nid, 0)
+                    if n_err < best_errors:
+                        best_errors = n_err
+                        preferred = node
+
+            # Reset error state liên quan đến guild và node cũ
+            guild_switch_ts: dict[int, list[float]] = getattr(self.bot, "_guild_switch_timestamps", {})
+            guild_switch_ts.pop(interaction.guild_id, None)
+            if old_node_id:
+                error_counts_dict: dict[str, int] = getattr(self.bot, "_node_error_counts", {})
+                error_counts_dict.pop(old_node_id, None)
+                last_err_dict: dict[str, float] = getattr(self.bot, "_node_last_error_time", {})
+                last_err_dict.pop(old_node_id, None)
+
+            player = await rebuild_player_session(
+                self.bot,
+                interaction,
+                channel=channel,
+                preferred_node=preferred,
+                reset_filters=True,
+            )
             if not player:
                 await self._send(
                     interaction,
@@ -1408,8 +1430,17 @@ class MusicCog(commands.Cog):
                 )
                 return
 
+            # Thông báo chi tiết cho user
+            new_node_id = player.node.identifier if player.node else "unknown"
+            if old_node_id and new_node_id != old_node_id:
+                notice = f"Đã sửa lỗi: chuyển node {old_node_id} -> {new_node_id}, reset filters."
+            elif old_node_id:
+                notice = f"Đã sửa lỗi: rebuild player trên node {new_node_id}, reset filters."
+            else:
+                notice = f"Đã sửa lỗi: kết nối mới trên node {new_node_id}, reset filters."
+
             settings = self._settings(interaction.guild_id)
-            embed = build_controller_embed(self.bot, player, notice="Đã sửa lỗi trình phát.")
+            embed = build_controller_embed(self.bot, player, notice=notice)
             view = PlayerControlView(self.bot) if settings.buttons_enabled else None
             message = await interaction.edit_original_response(embed=embed, view=view)
 
@@ -1418,7 +1449,7 @@ class MusicCog(commands.Cog):
                 if channel_id is not None:
                     getattr(self.bot, "controller_messages")[interaction.guild_id] = (channel_id, message.id)
             except Exception:
-                pass
+                logger.warning("Failed to save controller_messages ref guild=%s", interaction.guild_id)
 
     @app_commands.command(name="switchaudionode", description="Chuyển đổi máy chủ phát nhạc (multi-node)")
     @app_commands.describe(identifier="Node identifier")
@@ -1444,6 +1475,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, f"Node không hợp lệ. Available: {available}", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1490,6 +1523,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Mode không hợp lệ: on | off", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1511,6 +1546,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1546,6 +1583,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1628,7 +1667,7 @@ class MusicCog(commands.Cog):
     async def vibrato(self, interaction: discord.Interaction) -> None:
         await self._preset(interaction, "vibrato")
 
-    @app_commands.command(name="vibration", description="Bật bộ lọc Vibration")
+    @app_commands.command(name="vibration", description="Bật bộ lọc Vibrato (alias của /vibrato)")
     @app_commands.guild_only()
     async def vibration(self, interaction: discord.Interaction) -> None:
         await self._preset(interaction, "vibrato")
@@ -1819,8 +1858,10 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
-        seconds = max(0, int(seconds))
+        seconds = max(0, seconds)
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -1851,8 +1892,10 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
-        seconds = max(0, int(seconds))
+        seconds = max(0, seconds)
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -1882,6 +1925,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.current:
@@ -1908,6 +1953,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1918,7 +1965,7 @@ class MusicCog(commands.Cog):
                 await self._send(interaction, "Hàng đợi đang trống.", ephemeral=True)
                 return
 
-            idx = int(index) - 1
+            idx = index - 1
             if idx < 0 or idx >= len(player.queue):
                 await self._send(interaction, "Index không hợp lệ.", ephemeral=True)
                 return
@@ -1975,6 +2022,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -1985,7 +2034,7 @@ class MusicCog(commands.Cog):
                 await self._send(interaction, "Hàng đợi đang trống.", ephemeral=True)
                 return
 
-            idx = int(index) - 1
+            idx = index - 1
             if idx < 0 or idx >= len(player.queue):
                 await self._send(interaction, "Index không hợp lệ.", ephemeral=True)
                 return
@@ -2003,6 +2052,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Lệnh này chỉ dùng trong server.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.queue.history:
@@ -2034,6 +2085,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player:
@@ -2122,6 +2175,8 @@ class MusicCog(commands.Cog):
             await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with guild_lock(interaction.guild_id):
             player = await self._get_player(interaction, connect=False)
             if not player or not player.channel:
@@ -2337,7 +2392,8 @@ class SearchResultView(discord.ui.View):
             return
 
         try:
-            idx = int(interaction.data.get("values", ["0"])[0])  # type: ignore[union-attr]
+            data = interaction.data or {}
+            idx = int(data.get("values", ["0"])[0])
         except Exception:
             await interaction.response.send_message("Selection không hợp lệ.", ephemeral=True)
             return
@@ -2393,9 +2449,11 @@ class SearchResultView(discord.ui.View):
                 player.autoplay = wavelink.AutoPlayMode.partial
                 player.inactive_timeout = config.idle_timeout_seconds
                 try:
-                    await player.set_volume(settings.volume_default)
+                    await asyncio.wait_for(player.set_volume(settings.volume_default), timeout=PLAYER_OP_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning("set_volume timeout guild=%s (non-critical)", interaction.guild_id)
                 except Exception:
-                    pass
+                    logger.warning("Failed to set initial volume guild=%s", interaction.guild_id)
 
             if player.channel != member.voice.channel:
                 await interaction.followup.send(
@@ -2445,7 +2503,7 @@ class SearchResultView(discord.ui.View):
                 try:
                     await getattr(self._bot, "refresh_controller_message")(player)
                 except Exception:
-                    pass
+                    logger.debug("Failed to refresh controller in SearchResultView guild=%s", interaction.guild_id)
 
         embed = discord.Embed(title="Đã thêm")
         embed.description = f"Đã thêm '{track.title}' vào hàng đợi."
