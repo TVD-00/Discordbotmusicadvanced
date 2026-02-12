@@ -9,14 +9,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import aiohttp
 import discord
 from discord.ext import commands
-import wavelink
 
 from bot.utils import constants
+
+if TYPE_CHECKING:
+    import wavelink
 
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,13 @@ _LAST_LAVALINK_RECONNECT_AT = 0.0
 
 def is_lavalink_node_error(exc: BaseException) -> bool:
     # Nhận diện nhanh các lỗi transport/node từ Lavalink để kích hoạt fallback.
+    # Bao gồm cả LavalinkException (404 player not found, 5xx, v.v.)
+    import aiohttp
+    import wavelink
+
     if isinstance(exc, wavelink.exceptions.NodeException):
+        return True
+    if isinstance(exc, wavelink.exceptions.LavalinkException):
         return True
     if isinstance(exc, aiohttp.ClientError):
         return True
@@ -59,6 +66,8 @@ async def ensure_lavalink_connected(
     # Input: timeout_s (thời gian chờ reconnect), min_interval_s (chống spam reconnect),
     #        force_reconnect (ép reconnect ngay), bot (để nạp thêm fallback node nếu thiếu).
     # Output: True nếu có node CONNECTED, False nếu chưa sẵn sàng.
+
+    import wavelink
 
     def _has_connected_node() -> bool:
         try:
@@ -233,7 +242,9 @@ async def get_player(
     interaction: discord.Interaction,
     *,
     connect: bool,
-) -> wavelink.Player | None:
+) -> "wavelink.Player | None":
+    import wavelink
+
     guild = interaction.guild
     if not guild:
         return None
@@ -314,11 +325,11 @@ async def rebuild_player_session(
     interaction: discord.Interaction,
     *,
     channel: discord.VoiceChannel | discord.StageChannel | None = None,
-    old: wavelink.Player | None = None,
+    old: "wavelink.Player | None" = None,
     start_if_idle: bool = True,
-    preferred_node: wavelink.Node | None = None,
-    reset_filters: bool = False,
-) -> wavelink.Player | None:
+) -> "wavelink.Player | None":
+    import wavelink
+
     guild = interaction.guild
     if not guild:
         return None
@@ -377,24 +388,6 @@ async def rebuild_player_session(
         logger.exception("Failed to rebuild player guild=%s", guild.id)
         return None
 
-    # Ép chuyển sang node mong muốn nếu wavelink chọn node khác
-    if preferred_node is not None and player.node != preferred_node:
-        switch_fn = getattr(player, "switch_node", None)
-        if switch_fn is not None:
-            try:
-                await asyncio.wait_for(switch_fn(preferred_node), timeout=constants.PLAYER_OP_TIMEOUT)
-                logger.info(
-                    "Rebuild: switched player guild=%s to preferred node %s",
-                    guild.id,
-                    preferred_node.identifier,
-                )
-            except Exception:
-                logger.warning(
-                    "Rebuild: switch_node to %s failed guild=%s, giữ node hiện tại",
-                    preferred_node.identifier,
-                    guild.id,
-                )
-
     config = getattr(bot, "config", None)
     settings_store = getattr(bot, "settings", None)
     settings = settings_store.get(guild.id) if settings_store else None
@@ -415,17 +408,6 @@ async def rebuild_player_session(
             await asyncio.wait_for(player.set_volume(settings.volume_default), timeout=constants.PLAYER_OP_TIMEOUT)
     except Exception:
         logger.exception("Failed to set volume after rebuild guild=%s", guild.id)
-
-    # Reset filters trên player mới nếu được yêu cầu (forcefix)
-    if reset_filters:
-        try:
-            await asyncio.wait_for(
-                player.set_filters(wavelink.Filters()),
-                timeout=constants.PLAYER_OP_TIMEOUT,
-            )
-            logger.info("Rebuild: cleared filters guild=%s", guild.id)
-        except Exception:
-            logger.warning("Rebuild: failed to reset filters guild=%s", guild.id)
 
     if saved_queue:
         await player.queue.put_wait(saved_queue)
@@ -469,7 +451,7 @@ async def rebuild_player_session(
 #          Trả về True nếu ok, False nếu khác channel.
 # ------------------------------------------------------------------------------
 def ensure_same_channel(
-    interaction: discord.Interaction, player: wavelink.Player
+    interaction: discord.Interaction, player: "wavelink.Player"
 ) -> bool:
     user_vc = author_voice_channel(interaction)
     if not user_vc:
@@ -502,4 +484,12 @@ async def send_response(
         await interaction.response.send_message(**kwargs)
 
 
+# Giữ tên _send để tương thích với code cũ
+async def _send(interaction: discord.Interaction, content: str | None = None, *, embed: discord.Embed | None = None, ephemeral: bool = False) -> None:
+    # Wrapper cho send_response.
+    await send_response(interaction, content, embed=embed, ephemeral=ephemeral)
 
+
+def _author_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | discord.StageChannel | None:
+    # Alias cho author_voice_channel để tương thích với code cũ.
+    return author_voice_channel(interaction)

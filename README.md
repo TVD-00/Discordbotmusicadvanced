@@ -38,9 +38,12 @@ source .venv/bin/activate
 
 Cài đặt các gói phụ thuộc:
 ```bash
-pip install -r requirements.txt
-# Hoặc nếu dùng file pyproject.toml
 pip install .
+```
+
+Cho môi trường phát triển (lint/test):
+```bash
+pip install -e ".[dev]"
 ```
 
 ### 3. Cấu hình
@@ -61,7 +64,9 @@ python main.py
 ```
 bot-music/
 ├── bot/                # Source code chính của bot
-│   ├── commands/       # Các lệnh (Cogs)
+│   ├── cogs/           # Các lệnh slash (Cogs)
+│   ├── music/          # Giao diện controller + filter presets
+│   ├── storage/        # In-memory + SQLite storage
 │   ├── utils/          # Tiện ích bổ trợ
 │   ├── config.py       # Xử lý cấu hình
 │   └── bot.py          # Class bot chính

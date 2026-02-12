@@ -1001,6 +1001,24 @@ class FilterPresetSelect(discord.ui.Select):
                     await interaction.followup.send("Không thể áp dụng filter do phiên phát bị treo.", ephemeral=True)
                     return
                 player = new_player
+            except wavelink.exceptions.LavalinkException:
+                # Player không tồn tại trên Lavalink (404) hoặc session hết hạn -> rebuild
+                logger.warning("LavalinkException applying filter, rebuilding guild=%s preset=%r", interaction.guild_id, preset)
+                new_player = await rebuild_player_session(self._bot, interaction, old=player)
+                if not new_player:
+                    await interaction.followup.send("Phiên phát bị mất. Vui lòng thử lại.", ephemeral=True)
+                    return
+                player = new_player
+                # Retry filter trên player mới
+                try:
+                    await asyncio.wait_for(
+                        apply_filter_preset(self._bot, player, preset),
+                        timeout=PLAYER_OP_TIMEOUT,
+                    )
+                except Exception:
+                    logger.exception("Retry filter failed after rebuild guild=%s preset=%r", interaction.guild_id, preset)
+                    await interaction.followup.send("Không thể áp dụng filter sau khi khôi phục phiên.", ephemeral=True)
+                    return
             except ValueError:
                 await interaction.followup.send("Preset không hợp lệ.", ephemeral=True)
                 return

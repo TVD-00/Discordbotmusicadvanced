@@ -6,16 +6,16 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "discord.py>=2.4,<3",
-  "wavelink>=3.5,<4",
+  "wavelink>=3.4,<4",
   "python-dotenv>=1.0,<2",
   "aiosqlite>=0.20,<1",
-  "aiohttp>=3.9,<4",
 ]
 
 [project.optional-dependencies]
 dev = [
   "ruff>=0.3",
   "black>=24.1",
+  "pytest>=8.0",
 ]
 
 [tool.black]

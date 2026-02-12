@@ -38,8 +38,5 @@ def setup_logging(config: Config) -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-    # Discord/wavelink log rất nhiều ở DEBUG (heartbeat, gateway payload)
-    # nên đặt mức tối thiểu WARNING để tránh spam
-    lib_level = max(level, logging.WARNING)
-    logging.getLogger("discord").setLevel(lib_level)
-    logging.getLogger("wavelink").setLevel(lib_level)
+    logging.getLogger("discord").setLevel(level)
+    logging.getLogger("wavelink").setLevel(level)

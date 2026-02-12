@@ -14,8 +14,6 @@ from discord import app_commands
 from discord.ext import commands
 import wavelink
 
-from bot.utils.helpers import is_admin
-
 
 # ------------------------------------------------------------------------------
 # Class: MetaCog
@@ -30,6 +28,13 @@ class MetaCog(commands.Cog):
             await interaction.followup.send(content, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(content, ephemeral=ephemeral)
+
+    def _is_admin(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not member:
+            return False
+        perms = member.guild_permissions
+        return perms.administrator or perms.manage_guild
 
     @app_commands.command(name="help", description="Xem hướng dẫn sử dụng các lệnh")
     @app_commands.guild_only()
@@ -124,8 +129,8 @@ class MetaCog(commands.Cog):
     @app_commands.command(name="debug", description="Thu thập dữ liệu lỗi để báo cáo")
     @app_commands.guild_only()
     async def debug(self, interaction: discord.Interaction) -> None:
-        if not is_admin(interaction):
-            await self._send(interaction, "Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        if not self._is_admin(interaction):
+            await self._send(interaction, "Bạn không có quyền dùng lệnh này.", ephemeral=True)
             return
 
         lines: list[str] = []

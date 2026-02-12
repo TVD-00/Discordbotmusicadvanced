@@ -101,15 +101,6 @@ class MusicBot(commands.Bot):
         self._primary_node_identifier: str | None = None
         self._primary_health_task: asyncio.Task[None] | None = None
 
-        # Cooldown chuyển node theo guild: tránh vòng lặp join/leave
-        # Key: guild_id, Value: danh sách thời điểm chuyển (monotonic)
-        self._guild_switch_timestamps: dict[int, list[float]] = {}
-        self._guild_switch_max = 2          # Tối đa 2 lần switch
-        self._guild_switch_cooldown = 120   # Trong vòng 120 giây
-
-        # Lưu reference task để tránh bị GC thu hồi
-        self._background_tasks: set[asyncio.Task[None]] = set()
-
     # --------------------------------------------------------------------------
     # Method: setup_hook
     # Purpose: Khởi chạy khi bot bắt đầu. Kết nối DB, Lavalink, Load Cogs.
@@ -369,23 +360,13 @@ class MusicBot(commands.Bot):
             total = sum(deleted.values())
             if total > 0:
                 logger.info("DB cleanup orphaned guilds: %s", deleted)
-
-            # Dọn dẹp in-memory dicts cho guild đã rời
-            for guild_id in list(self.controller_messages.keys()):
-                if guild_id not in active_guilds:
-                    self.controller_messages.pop(guild_id, None)
-            for guild_id in list(self._current_track.keys()):
-                if guild_id not in active_guilds:
-                    self._current_track.pop(guild_id, None)
-            for guild_id in list(self._previous_track.keys()):
-                if guild_id not in active_guilds:
-                    self._previous_track.pop(guild_id, None)
-            for guild_id in list(self._guild_switch_timestamps.keys()):
-                if guild_id not in active_guilds:
-                    self._guild_switch_timestamps.pop(guild_id, None)
         except Exception:
             logger.exception("Failed to cleanup orphaned guilds (non-critical)")
 
+    # --------------------------------------------------------------------------
+    # Method: on_app_command_error
+    # Purpose: Xử lý lỗi toàn cục cho Slash Commands.
+    # --------------------------------------------------------------------------
     # --------------------------------------------------------------------------
     # Method: on_app_command_error
     # Purpose: Xử lý lỗi toàn cục cho Slash Commands.
@@ -411,6 +392,10 @@ class MusicBot(commands.Bot):
             pass
 
 
+    # --------------------------------------------------------------------------
+    # Method: global_interaction_check
+    # Purpose: Logic kiểm tra quyền (Whitelist Channel / Command Restriction).
+    # --------------------------------------------------------------------------
     # --------------------------------------------------------------------------
     # Method: global_interaction_check
     # Purpose: Logic kiểm tra quyền (Whitelist Channel / Command Restriction).
@@ -450,8 +435,21 @@ class MusicBot(commands.Bot):
     # --------------------------------------------------------------------------
     async def close(self) -> None:
         logger.info("Shutting down bot - cleaning up resources...")
+
+        # 1. Dừng health-check task để tránh task nền còn chạy khi bot tắt.
+        health_task = self._primary_health_task
+        if health_task and not health_task.done():
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed to cancel primary health-check task")
+
+        self._primary_health_task = None
         
-        # 1. Disconnect tất cả players để tránh orphan connections
+        # 2. Disconnect tất cả players để tránh orphan connections
         disconnect_count = 0
         for vc in list(self.voice_clients):
             try:
@@ -465,13 +463,13 @@ class MusicBot(commands.Bot):
         if disconnect_count > 0:
             logger.info("Disconnected %d voice clients", disconnect_count)
         
-        # 2. Đóng kết nối Lavalink Pool
+        # 3. Đóng kết nối Lavalink Pool
         try:
             await wavelink.Pool.close()
         except Exception:
             logger.exception("Failed to close wavelink pool")
         
-        # 3. Đóng kết nối Database
+        # 4. Đóng kết nối Database
         try:
             await self.storage.close()
             logger.info("Database connection closed")
@@ -560,36 +558,7 @@ class MusicBot(commands.Bot):
             await self._try_switch_to_better_node(player, node_id)
 
     async def _try_switch_to_better_node(self, player: wavelink.Player, bad_node_id: str) -> None:
-        """Thử chuyển player sang node khác tốt hơn, restore filter và queue.
-        Có cooldown per-guild để tránh vòng lặp join/leave (ping-pong).
-        """
-        guild = player.guild
-        if not guild:
-            return
-
-        # Kiểm tra cooldown: tối đa _guild_switch_max lần switch trong _guild_switch_cooldown giây
-        now = time.monotonic()
-        switch_times = self._guild_switch_timestamps.get(guild.id, [])
-        # Lọc bỏ các timestamp quá cũ
-        cutoff = now - self._guild_switch_cooldown
-        switch_times = [t for t in switch_times if t > cutoff]
-        self._guild_switch_timestamps[guild.id] = switch_times
-
-        if len(switch_times) >= self._guild_switch_max:
-            logger.warning(
-                "Guild %s đã switch node %d lần trong %ds - skip track thay vì switch tiếp",
-                guild.id,
-                len(switch_times),
-                self._guild_switch_cooldown,
-            )
-            # Skip track hiện tại thay vì switch node liên tục
-            try:
-                await player.skip(force=True)
-            except Exception:
-                logger.exception("Failed to skip stuck track guild=%s after max switches", guild.id)
-            await self.refresh_controller_message(player)
-            return
-
+        """Thử chuyển player sang node khác tốt hơn, restore filter và queue."""
         pool_nodes = wavelink.Pool.nodes
 
         # Tìm node khác đang connected và có ít lỗi hơn
@@ -614,7 +583,12 @@ class MusicBot(commands.Bot):
             )
             return
 
-        # KHÔNG reset error count của node cũ - để nó tự decay qua _node_error_window
+        # Reset error count của node cũ (cho lần sau)
+        self._node_error_counts[bad_node_id] = 0
+
+        guild = player.guild
+        if not guild:
+            return
 
         channel = player.channel
         if not channel:
@@ -631,8 +605,6 @@ class MusicBot(commands.Bot):
         if switch_node is not None:
             try:
                 await asyncio.wait_for(switch_node(best_node), timeout=constants.PLAYER_OP_TIMEOUT)
-                # Ghi nhận switch thành công cho cooldown
-                self._guild_switch_timestamps.setdefault(guild.id, []).append(time.monotonic())
                 await self.refresh_controller_message(player)
                 logger.info(
                     "Switched player guild=%s to node %s via switch_node",
@@ -680,7 +652,7 @@ class MusicBot(commands.Bot):
             )
 
             # Restore volume
-            await asyncio.wait_for(new_player.set_volume(saved_volume), timeout=constants.PLAYER_OP_TIMEOUT)
+            await new_player.set_volume(saved_volume)
 
             # Restore filters - Quan trọng: phải re-apply filters
             if saved_filters:
@@ -716,9 +688,6 @@ class MusicBot(commands.Bot):
             # Cập nhật panel
             await self.refresh_controller_message(new_player)
 
-            # Ghi nhận switch thành công cho cooldown
-            self._guild_switch_timestamps.setdefault(guild.id, []).append(time.monotonic())
-
             logger.info(
                 "Successfully switched player guild=%s to node %s. Queue=%d, Filters=%s",
                 guild.id,
@@ -738,7 +707,7 @@ class MusicBot(commands.Bot):
                     channel.connect(cls=wavelink.Player, self_deaf=True),  # type: ignore[arg-type]
                     timeout=constants.VOICE_CONNECT_TIMEOUT,
                 )
-                await asyncio.wait_for(recovery_player.set_volume(saved_volume), timeout=constants.PLAYER_OP_TIMEOUT)
+                await recovery_player.set_volume(saved_volume)
                 if saved_current:
                     await asyncio.wait_for(
                         recovery_player.play(saved_current),
@@ -760,9 +729,7 @@ class MusicBot(commands.Bot):
                 return
             await self.refresh_controller_message(player)
 
-        task = asyncio.create_task(_delayed_refresh(), name=f"delayed-refresh-{player.guild.id}")
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        asyncio.create_task(_delayed_refresh())
 
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload) -> None:
         player = payload.player
@@ -809,7 +776,7 @@ class MusicBot(commands.Bot):
         try:
             await channel.send(embed=embed)
         except discord.HTTPException:
-            logger.debug("Failed to send announce message guild=%s", player.guild.id)
+            pass
 
     def get_previous_track(self, guild_id: int) -> wavelink.Playable | None:
         return self._previous_track.get(guild_id)
@@ -907,10 +874,6 @@ class MusicBot(commands.Bot):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        # Bỏ qua voice state update của chính bot để tránh vòng lặp
-        if self.user and member.id == self.user.id:
-            return
-
         if not before.channel:
             return
 
